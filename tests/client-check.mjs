@@ -13,6 +13,7 @@ const React = {
   createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
   useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
   useEffect: () => {},
+  useRef: (initial) => ({ current: initial }),
   useMemo: (fn) => fn(),
   memo: (component) => component,
 }

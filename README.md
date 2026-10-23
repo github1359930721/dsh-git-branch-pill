@@ -7,7 +7,24 @@ DeepSeek Harness (DSH) Web 插件：在**每个会话**的输入框下方 dock �
 
 修的是「分支名只有新建会话页能看到」的问题：原生 workspace 胶囊和 `@linxin666/dsh-client-ui-git-graph` 的分支选择器都只挂在英雄区（blank 空态）出现，这个胶囊挂在 `conversation.composer.dock`，所以老会话、跑着的会话同样可见。
 
-> 与 git-graph 的区别：那个是**分支选择器**（能切分支，仅 blank 会话）；这个是**状态显示**（只读，所有会话）。两者可共存。
+## 与 git-graph 协作（可选）
+
+装了 [`@linxin666/dsh-client-ui-git-graph`](https://www.npmjs.com/package/@linxin666/dsh-client-ui-git-graph) 时，胶囊**升级为可切换分支**：
+
+- **普通点击** → 弹出可筛选的分支列表，选中即切换（真实执行 `git switch`，含它的冲突/占用守卫）
+- **Ctrl+点击**（macOS 为 Cmd+点击）→ 复制分支名
+- 下拉箭头只有在该插件可用时才出现；没装则点击退回「复制分支名」
+
+桥接方式**不是导入**它的代码，而是复用它 Host 半已经注册的路由：
+
+| 路由 | 用途 |
+| --- | --- |
+| `POST /git/config` | 探测插件是否在线（也拿 worktreesHome） |
+| `POST /git/branches` | `{ path }` → 分支列表 + 当前分支 + 脏文件数 |
+| `POST /git/status` | `{ path }` → 仓库快照 |
+| `POST /git/switch` | `{ path, branch }` → 真正切分支 |
+
+因此：**git-graph 升级/改动不会破坏胶囊**，卸载它则胶囊自动降级为只读复制，不会报错。探测结果缓存在页面内存里，每会话只探一次。
 
 ## 安装
 
@@ -98,12 +115,17 @@ node tests/handler-check.mjs        # 端点：真实仓库 / 非仓库 / 缺失
 node tests/host-hardening.mjs       # Host 加固：git 解析、git 缺失上报、LRU 容量压测
 node tests/poll-behavior.mjs        # 切分支可见性：缓存命中 / fresh=1 / TTL 后轮询 / 分离 HEAD
 node tests/client-check.mjs         # client bundle：manifest dsh.client、inject、slot 注册、locale、五种渲染状态
+node tests/bridge-check.mjs         # git-graph 桥接降级：无该插件时点击安全、不渲染菜单
 node tests/composed-row-check.mjs   # 端到端：profile 清单 + 行解析 + 工厂 require 是否都是 seed 模块
 node tests/activation-scan.mjs      # 对比官方插件的清单声明（排查「不渲染」）
 node tests/profile-check.mjs        # profile 层里是否有本 bundle
 node tests/client-graph-check.mjs   # 同上，含 bundle 目录与 patch 路径
 node tests/sessions-by-cwd.mjs      # 按工作目录分组已有会话（用于挑最早的会话做验证）
 node tests/loader-contract.mjs      # 页面模块表的 require 契约（排查 require 未命中）
+
+# 需要正在运行的 DSH Web UI + 已装 git-graph：
+node tests/git-graph-live.mjs  http://127.0.0.1:<port> <目录>   # 路由是否 MOUNTED（404=插件没装）
+node tests/git-graph-read.mjs  http://127.0.0.1:<port> <目录>   # 真读分支列表
 ```
 
 `handler-check`、`host-hardening` 与 `poll-behavior` 需要本机有 `git`（后者会建临时仓库并真的切分支）；其余纯 Node。

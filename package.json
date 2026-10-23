@@ -1,6 +1,6 @@
 {
   "name": "dsh-git-branch-pill",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "DeepSeek Harness Web plugin: shows every Session's Git branch as a live pill in the composer dock, including active conversations.",
   "type": "module",
   "license": "MIT",
@@ -18,7 +18,9 @@
     "dsh-plugin",
     "deepseek-harness",
     "git",
-    "branch"
+    "branch",
+    "git-graph",
+    "worktree"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

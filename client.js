@@ -29,6 +29,19 @@ window.__ModuleLoader__.load({
 .gbp-pill[data-state="copied"]{border-color:var(--dsh-accent,#247bbf);color:var(--dsh-accent,#247bbf)}
 .gbp-icon{flex:none;display:block;opacity:.75}
 .gbp-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+.gbp-menu{position:fixed;z-index:2147483000;display:flex;flex-direction:column;gap:.35rem;width:min(20rem,calc(100vw - 2rem));max-height:min(24rem,60vh);padding:.5rem;border:1px solid var(--dsh-border-subtle,rgba(127,127,127,.3));border-radius:.6rem;background:var(--dsh-surface-raised,#fff);color:var(--dsh-text-primary,inherit);box-shadow:0 8px 28px rgba(0,0,0,.18);font:inherit;font-size:.8rem}
+.gbp-menu-title{font-size:.75rem;font-weight:600;opacity:.7;padding:0 .25rem}
+.gbp-menu-filter{width:100%;padding:.3rem .45rem;border:1px solid var(--dsh-border-subtle,rgba(127,127,127,.3));border-radius:.4rem;background:transparent;color:inherit;font:inherit;font-size:.8rem}
+.gbp-menu-filter:focus-visible{outline:2px solid var(--dsh-accent,#247bbf);outline-offset:1px}
+.gbp-menu-list{list-style:none;margin:0;padding:0;overflow-y:auto;display:flex;flex-direction:column;gap:.1rem}
+.gbp-menu-item{display:flex;align-items:center;gap:.4rem;width:100%;padding:.32rem .45rem;border:0;border-radius:.35rem;background:transparent;color:inherit;font:inherit;font-size:.8rem;text-align:left;cursor:pointer}
+.gbp-menu-item:hover:not(:disabled){background:var(--dsh-fill-subtle,rgba(127,127,127,.12))}
+.gbp-menu-item[data-current="true"]{font-weight:600;cursor:default}
+.gbp-menu-item:disabled{opacity:.75}
+.gbp-menu-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.gbp-menu-badge{flex:none;font-size:.7rem;opacity:.65}
+.gbp-menu-empty,.gbp-menu-error{padding:.4rem .45rem;font-size:.75rem;opacity:.75}
+.gbp-menu-error{color:var(--dsh-warning,#b8860b);opacity:1}
 `
 
     /** Session-scoped answer cache: one Session asks for one directory. */
@@ -145,8 +158,25 @@ window.__ModuleLoader__.load({
       const directory = useSessions((snapshot) => (sessionId === undefined ? undefined : snapshot.byId[sessionId]?.cwd))
       const [answer, setAnswer] = React.useState(() => (typeof directory === 'string' ? answers.get(directory) : undefined))
       const [copied, setCopied] = React.useState(false)
+      const [menuOpen, setMenuOpen] = React.useState(false)
+      const [anchor, setAnchor] = React.useState(null)
+      const [canSwitch, setCanSwitch] = React.useState(false)
+      const buttonRef = React.useRef(null)
       // Passed down from `apply` so the component stays testable on its own.
       const translate = t ?? fallbackTranslate
+
+      // Probe the git-graph bridge once per directory: it decides whether a
+      // click opens the picker or merely copies the branch name.
+      React.useEffect(() => {
+        if (typeof directory !== 'string' || directory === '') return undefined
+        let live = true
+        bridgeAvailable().then((ok) => {
+          if (live) setCanSwitch(ok)
+        })
+        return () => {
+          live = false
+        }
+      }, [directory])
 
       React.useEffect(() => {
         if (typeof directory !== 'string' || directory === '') {
@@ -254,6 +284,23 @@ window.__ModuleLoader__.load({
           () => undefined,
         )
       }
+      const openMenu = () => {
+        const rect = buttonRef.current?.getBoundingClientRect?.()
+        setAnchor(rect === undefined ? null : { left: rect.left, top: rect.top })
+        setMenuOpen(true)
+      }
+      const onClick = (event) => {
+        // A1: plain click switches, Ctrl/Cmd+click copies. Without the bridge
+        // there is nothing to switch with, so the click copies instead.
+        if (event.ctrlKey || event.metaKey || !canSwitch) {
+          copy()
+          return
+        }
+        openMenu()
+      }
+      const hint = (canSwitch ? translate('pill.copyHint') : translate('pill.copyHintPlain')).split('Ctrl+click').join(
+        typeof navigator !== 'undefined' && /mac/i.test(navigator.platform ?? '') ? 'Cmd+click' : 'Ctrl+click',
+      )
 
       return h(
         'span',
@@ -261,19 +308,60 @@ window.__ModuleLoader__.load({
         h(
           'button',
           {
+            ref: buttonRef,
             type: 'button',
             className: 'gbp-pill',
             'data-state': copied ? 'copied' : 'ready',
             'data-git-branch': label,
-            title: `${directory}\n${text}\n${translate('pill.copyHint')}`,
-            'aria-label': `${text} — ${translate('pill.copyHint')}`,
-            onClick: copy,
+            'data-switchable': canSwitch ? 'true' : 'false',
+            title: `${directory}\n${text}\n${hint}`,
+            'aria-label': `${text} — ${hint}`,
+            'aria-haspopup': canSwitch ? 'dialog' : undefined,
+            'aria-expanded': canSwitch ? (menuOpen ? 'true' : 'false') : undefined,
+            onClick,
           },
           // createElement does not flatten an array passed as the third
           // argument into children, so the icon and label go as siblings.
           h(BranchIcon),
           h('span', { className: 'gbp-label', children: copied ? translate('pill.copied') : text }),
+          canSwitch ? h(ChevronIcon) : null,
         ),
+        menuOpen && canSwitch
+          ? h(BranchMenu, {
+              directory,
+              current: answer.detached ? '' : label,
+              anchor,
+              translate,
+              onClose: () => setMenuOpen(false),
+              onPicked: (name) => {
+                setMenuOpen(false)
+                // The poll would catch this within 3s; seed it so the pill
+                // changes as soon as the Host confirms the switch.
+                answers.set(directory, { ...answer, branch: name, detached: false })
+                setAnswer({ ...answer, branch: name, detached: false })
+              },
+            })
+          : null,
+      )
+    }
+
+    /** Small down chevron shown only when the picker is available. */
+    function ChevronIcon() {
+      return h(
+        'svg',
+        {
+          className: 'gbp-icon',
+          viewBox: '0 0 16 16',
+          width: 10,
+          height: 10,
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.8,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': true,
+        },
+        h('path', { d: 'M4 6.5 8 10.5 12 6.5' }),
       )
     }
 
@@ -322,8 +410,19 @@ window.__ModuleLoader__.load({
         'pill.unknown': '查询分支失败：网络、登录态或 Host 超时，稍后会自动重试',
         'pill.missingDirectory': '会话工作目录已不存在',
         'pill.gitMissing': '找不到 git 可执行文件：请确认已安装 git 并加入 DSH 进程的 PATH',
-        'pill.copyHint': '点击复制分支名',
+        'pill.copyHint': '点击切换分支，Ctrl+点击复制分支名',
+        'pill.copyHintPlain': '点击复制分支名',
         'pill.copied': '已复制',
+        'menu.title': '切换分支',
+        'menu.loading': '正在读取分支…',
+        'menu.empty': '没有本地分支',
+        'menu.filter': '筛选分支',
+        'menu.current': '当前分支',
+        'menu.switching': '正在切换到 {branch}…',
+        'menu.switched': '已切换到 {branch}',
+        'menu.failed': '切换失败：{message}',
+        'menu.unavailable': '需要安装 @linxin666/dsh-client-ui-git-graph 才能切换分支',
+        'menu.detached': '当前为分离 HEAD，选择分支可切回',
       },
       en: {
         'pill.branch': '{branch}',
@@ -332,8 +431,19 @@ window.__ModuleLoader__.load({
         'pill.unknown': 'Branch lookup failed: network, auth or Host timeout. It retries automatically.',
         'pill.missingDirectory': 'This Session working directory no longer exists',
         'pill.gitMissing': 'No git executable found: install git and put it on the DSH process PATH',
-        'pill.copyHint': 'Click to copy the branch name',
+        'pill.copyHint': 'Click to switch branch, Ctrl+click to copy the name',
+        'pill.copyHintPlain': 'Click to copy the branch name',
         'pill.copied': 'copied',
+        'menu.title': 'Switch branch',
+        'menu.loading': 'Reading branches…',
+        'menu.empty': 'No local branches',
+        'menu.filter': 'Filter branches',
+        'menu.current': 'current',
+        'menu.switching': 'Switching to {branch}…',
+        'menu.switched': 'Switched to {branch}',
+        'menu.failed': 'Switch failed: {message}',
+        'menu.unavailable': 'Install @linxin666/dsh-client-ui-git-graph to switch branches here',
+        'menu.detached': 'Detached HEAD — pick a branch to return',
       },
     }
 
@@ -342,6 +452,203 @@ window.__ModuleLoader__.load({
       const template = DICTIONARY.en[key] ?? key
       if (vars === undefined) return template
       return Object.entries(vars).reduce((text, [name, value]) => text.split(`{${name}}`).join(String(value)), template)
+    }
+
+    //#region git-graph bridge
+    /**
+     * Optional bridge to `@linxin666/dsh-client-ui-git-graph`.
+     *
+     * That plugin already owns real `git switch` on the Host half behind a POST
+     * JSON protocol, but its selector only mounts in the blank hero state. When
+     * it is installed we borrow its routes so the pill can switch branches in an
+     * active Session; when it is absent every call here fails closed and the pill
+     * falls back to copy-only. Nothing is imported from the other package, so
+     * upgrading or removing it never breaks rendering.
+     */
+    const GIT_GRAPH = {
+      probe: '/git/config',
+      branches: '/git/branches',
+      status: '/git/status',
+      switch: '/git/switch',
+    }
+
+    /** Cache the availability probe so a poll does not ask every tick. */
+    let bridgeProbe
+
+    /** POST JSON the way the git-graph Host half expects it. */
+    async function postGit(path, payload) {
+      const response = await fetch(path, {
+        method: 'POST',
+        cache: 'no-store',
+        credentials: 'same-origin',
+        headers: { 'content-type': 'application/json', accept: 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const body = await response.json()
+      if (body?.ok !== true) throw new Error(body?.error?.message ?? body?.error?.code ?? 'git-graph refused')
+      return body.value
+    }
+
+    /**
+     * Whether the git-graph bridge answers at all.
+     * @returns {Promise<boolean>} true when its routes are mounted and reachable.
+     */
+    async function bridgeAvailable() {
+      bridgeProbe ??= postGit(GIT_GRAPH.probe, {})
+        .then(() => true)
+        .catch(() => false)
+      return await bridgeProbe
+    }
+
+    /** Drop a cached probe so a later render re-checks (after installing git-graph). */
+    function resetBridgeProbe() {
+      bridgeProbe = undefined
+    }
+
+    /**
+     * List local branches for one directory.
+     * @param {string} directory - Session working directory.
+     * @returns {Promise<{ root: string, branch: string, branches: {name: string, current: boolean}[] } | null>}
+     */
+    async function listBranches(directory) {
+      try {
+        return await postGit(GIT_GRAPH.branches, { path: directory })
+      } catch (error) {
+        reportFailure(`git-graph branches failed (${error?.message ?? error})`)
+        return null
+      }
+    }
+
+    /**
+     * Ask git-graph to switch this directory to `branch`.
+     * @param {string} directory - Session working directory.
+     * @param {string} branch - target local branch.
+     * @returns {Promise<{ ok: boolean, branch?: string, message?: string }>}
+     */
+    async function switchBranch(directory, branch) {
+      try {
+        const value = await postGit(GIT_GRAPH.switch, { path: directory, branch })
+        return { ok: true, branch: typeof value?.branch === 'string' ? value.branch : branch }
+      } catch (error) {
+        return { ok: false, message: error?.message ?? String(error) }
+      }
+    }
+    //#endregion
+
+    /**
+     * Branch picker. Rendered into a fixed-position layer so the composer's
+     * own stacking context cannot clip it; closes on Escape or an outside click.
+     */
+    function BranchMenu({ directory, current, anchor, onPicked, onClose, translate }) {
+      const [state, setState] = React.useState({ phase: 'loading', branches: [], error: null })
+      const [filter, setFilter] = React.useState('')
+      const [busy, setBusy] = React.useState(null)
+      const rootRef = React.useRef(null)
+      const inputRef = React.useRef(null)
+
+      React.useEffect(() => {
+        let live = true
+        listBranches(directory).then((view) => {
+          if (!live) return
+          if (view === null) {
+            setState({ phase: 'error', branches: [], error: translate('menu.unavailable') })
+            return
+          }
+          setState({ phase: 'ready', branches: view.branches ?? [], error: null })
+        })
+        return () => {
+          live = false
+        }
+      }, [directory])
+
+      React.useEffect(() => {
+        inputRef.current?.focus()
+        const onKey = (event) => {
+          if (event.key === 'Escape') {
+            event.stopPropagation()
+            onClose()
+          }
+        }
+        const onPointer = (event) => {
+          if (rootRef.current !== null && !rootRef.current.contains(event.target)) onClose()
+        }
+        document.addEventListener('keydown', onKey, true)
+        document.addEventListener('pointerdown', onPointer, true)
+        return () => {
+          document.removeEventListener('keydown', onKey, true)
+          document.removeEventListener('pointerdown', onPointer, true)
+        }
+      }, [onClose])
+
+      const pick = async (name) => {
+        if (busy !== null) return
+        setBusy(name)
+        const result = await switchBranch(directory, name)
+        setBusy(null)
+        if (result.ok) {
+          onPicked(result.branch ?? name)
+          return
+        }
+        setState((previous) => ({ ...previous, error: translate('menu.failed', { message: result.message }) }))
+      }
+
+      const items = state.branches.filter((row) => filter === '' || row.name.toLowerCase().includes(filter.trim().toLowerCase()))
+      const style = anchor === null ? { position: 'fixed', left: 24, bottom: 120 } : {
+        position: 'fixed',
+        left: Math.max(8, Math.min(anchor.left, (typeof window === 'undefined' ? anchor.left : window.innerWidth) - 320)),
+        bottom: Math.max(8, (typeof window === 'undefined' ? 800 : window.innerHeight) - anchor.top + 8),
+      }
+
+      return h(
+        'div',
+        {
+          ref: rootRef,
+          className: 'gbp-menu',
+          style,
+          role: 'dialog',
+          'aria-label': translate('menu.title'),
+          'data-git-branch-menu': 'true',
+        },
+        h('div', { className: 'gbp-menu-title', children: translate('menu.title') }),
+        h('input', {
+          ref: inputRef,
+          className: 'gbp-menu-filter',
+          type: 'search',
+          value: filter,
+          placeholder: translate('menu.filter'),
+          onChange: (event) => setFilter(event.target.value),
+        }),
+        state.error !== null ? h('div', { className: 'gbp-menu-error', children: state.error }) : null,
+        state.phase === 'loading'
+          ? h('div', { className: 'gbp-menu-empty', children: translate('menu.loading') })
+          : items.length === 0
+            ? h('div', { className: 'gbp-menu-empty', children: translate('menu.empty') })
+            : h(
+                'ul',
+                { className: 'gbp-menu-list' },
+                items.map((row) =>
+                  h(
+                    'li',
+                    { key: row.name },
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        className: 'gbp-menu-item',
+                        'data-current': row.name === current ? 'true' : 'false',
+                        disabled: busy !== null || row.name === current,
+                        onClick: () => pick(row.name),
+                      },
+                      h('span', { className: 'gbp-menu-name', children: row.name }),
+                      row.name === current ? h('span', { className: 'gbp-menu-badge', children: translate('menu.current') }) : null,
+                      busy === row.name ? h('span', { className: 'gbp-menu-badge', children: '…' }) : null,
+                    ),
+                  ),
+                ),
+              ),
+      )
     }
 
     // Test seam only: the module keeps its answer cache private, so a headless
