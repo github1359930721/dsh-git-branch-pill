@@ -87,26 +87,48 @@ for (const [name, ok, actual] of checks) {
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name}: ${String(actual)}`)
 }
 
-// Render the component with a stub hook seat: unknown answer hides, repo answer shows the branch.
-const render = (cwd, answer) => {
-  const component = registered.component
-  const cache = {}
+// Render with a stub hook seat. Three states must stay distinguishable:
+// no session → nothing, unknown answer → warning pill, known non-repo → nothing.
+const render = (cwd) => {
   const useSessions = (selector) => selector({ byId: cwd === undefined ? {} : { 's-1': { cwd } } })
-  // The module caches answers privately; drive the visible path by rendering
-  // after a no-op effect, so only the "no answer yet" branch is reachable here.
-  void cache
-  void answer
-  return component({ useSessions, sessionId: 's-1', t: undefined })
+  return registered.component({ useSessions, sessionId: 's-1', t: undefined })
 }
 
-const hidden = render('D:\\project\\go\\IM-APP')
+const unknown = render('D:\\project\\go\\IM-APP')
 const noSession = render(undefined)
-const hiddenOk = hidden === null || hidden === undefined
+
+// Unknown: a warning pill, because silence cannot be told apart from "not a repo".
+// The component returns `PillShell` (props.state = 'error') for that case.
+const unknownIsWarning = unknown !== null && unknown !== undefined && unknown.props?.state === 'error'
+if (!unknownIsWarning) failed += 1
+console.log(`${unknownIsWarning ? 'PASS' : 'FAIL'} unknown answer renders a warning pill`)
+
+// No session: nothing at all.
 const noSessionOk = noSession === null || noSession === undefined
-if (!hiddenOk) failed += 1
 if (!noSessionOk) failed += 1
-console.log(`${hiddenOk ? 'PASS' : 'FAIL'} hides until the branch answer arrives: ${JSON.stringify(hidden)}`)
 console.log(`${noSessionOk ? 'PASS' : 'FAIL'} hides without a session: ${JSON.stringify(noSession)}`)
+
+// A known non-repository renders nothing, so plain folders stay clean.
+globalThis.__seedAnswers?.('D:\\plain-folder', { repo: false, branch: null, detached: false })
+const plain = render('D:\\plain-folder')
+const plainHidden = plain === null || plain === undefined
+if (!plainHidden) failed += 1
+console.log(`${plainHidden ? 'PASS' : 'FAIL'} confirmed non-repository renders nothing`)
+
+// A known branch renders the label button that offers the copy affordance.
+globalThis.__seedAnswers?.('D:\\repo', { repo: true, branch: 'mzj', detached: false })
+const repo = render('D:\\repo')
+const button = repo?.children?.[0]
+const repoOk = button?.type === 'button' && button?.props?.['data-git-branch'] === 'mzj' && button?.props?.onClick !== undefined
+if (!repoOk) failed += 1
+console.log(`${repoOk ? 'PASS' : 'FAIL'} known branch renders a clickable pill`)
+
+// A vanished directory is reported rather than silently hidden.
+globalThis.__seedAnswers?.('D:\\gone', { repo: false, branch: null, detached: false, reason: 'missing-directory' })
+const gone = render('D:\\gone')
+const goneOk = gone !== null && gone !== undefined && gone.props?.state === 'error'
+if (!goneOk) failed += 1
+console.log(`${goneOk ? 'PASS' : 'FAIL'} missing directory renders a warning pill`)
 
 console.log(failed === 0 ? 'ALL PASS' : `${failed} FAILED`)
 process.exit(failed === 0 ? 0 : 1)

@@ -38,6 +38,14 @@ export function apply(ctx) {
   /** @type {Map<string, { value: unknown, at: number, ttl: number }>} */
   const cache = new Map()
 
+  /**
+   * Resolved `git` executable, or null once resolution failed. The Electron main
+   * process often runs with a narrower PATH than a terminal, so a missing git is
+   * reported to the pill instead of looking like "not a repository".
+   */
+  let gitExecutable
+  let gitResolution
+
   /** Read one cache entry, dropping it when stale. */
   const cached = (key) => {
     const entry = cache.get(key)
@@ -46,28 +54,59 @@ export function apply(ctx) {
       cache.delete(key)
       return undefined
     }
+    // LRU: a hit moves the key to the end, so hot directories outlive cold ones.
+    cache.delete(key)
+    cache.set(key, entry)
     return entry.value
   }
 
-  /** Store one cache entry and evict the oldest when the map is full. */
+  /** Store one cache entry and evict the least recently used when full. */
   const remember = (key, value, ttl) => {
     if (cache.size >= CACHE_LIMIT) {
       const oldest = cache.keys().next()
       if (!oldest.done) cache.delete(oldest.value)
     }
+    cache.delete(key)
     cache.set(key, { value, at: Date.now(), ttl })
   }
 
+  /**
+   * Resolve `git` once. A Host build with no subprocess service falls back to
+   * PATH lookup, which is what a terminal launch already provides.
+   * @returns {Promise<string | null>} the executable path, or null when absent.
+   */
+  const resolveGit = async () => {
+    if (gitExecutable !== undefined) return gitExecutable
+    gitResolution ??= (async () => {
+      const subprocess = ctx.get('subprocess')
+      try {
+        if (typeof subprocess?.resolveExecutable === 'function') {
+          const resolved = await subprocess.resolveExecutable('git')
+          return typeof resolved === 'string' && resolved !== '' ? resolved : 'git'
+        }
+        return 'git'
+      } catch (error) {
+        ctx.logger.warn('git-branch-pill: no git executable: %s', error)
+        return null
+      }
+    })()
+    gitExecutable = await gitResolution
+    return gitExecutable
+  }
+
   /** Run `git` in one directory and resolve its stdout, or null on any failure. */
-  const git = (cwd, argv) =>
-    new Promise((resolve) => {
+  const git = async (cwd, argv) => {
+    const executable = await resolveGit()
+    if (executable === null) return null
+    return await new Promise((resolve) => {
       execFile(
-        'git',
+        executable,
         argv,
         { cwd, timeout: GIT_TIMEOUT_MS, windowsHide: true, maxBuffer: 64 * 1024 },
         (error, stdout) => resolve(error === null ? stdout : null),
       )
     })
+  }
 
   /** Annotate the two detached cases with `<sha>` / `<tag>` rather than a bare SHA. */
   const describeDetached = (head) => {
@@ -78,10 +117,16 @@ export function apply(ctx) {
   /**
    * Resolve the branch checked out in one directory.
    * @param {string} cwd - absolute Session working directory.
-   * @returns {Promise<{ repo: boolean, branch: string | null, detached: boolean }>}
+   * @returns {Promise<{ repo: boolean, branch: string | null, detached: boolean, reason?: string | null, gitMissing?: boolean }>}
    */
   const readBranch = async (cwd) => {
     const resolved = await git(cwd, ['rev-parse', '--is-inside-work-tree'])
+    if (resolved === null && (await resolveGit()) === null) {
+      // `git` could not run at all: not installed, absent from this process's
+      // PATH (common under the Electron main process), or it timed out. Distinct
+      // from "ran fine and said this is not a repository".
+      return { repo: false, branch: null, detached: false, reason: 'git-missing', gitMissing: true }
+    }
     if (resolved === null || resolved.trim() !== 'true') {
       // Not a work tree: still a repository when the directory is inside a bare
       // or `.git` path, and simply not versioned otherwise.
