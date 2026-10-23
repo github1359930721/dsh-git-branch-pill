@@ -1,7 +1,7 @@
 {
   "name": "dsh-git-branch-pill",
   "version": "1.1.1",
-  "description": "DSH plugin: a live Git branch pill under every Session's composer — it never disappears in a non-Git folder, and switches branches when git-graph is installed.",
+  "description": "Show the Git branch under every DSH Session's composer, and switch it when git-graph is installed.",
   "type": "module",
   "license": "MIT",
   "author": "github1359930721",
