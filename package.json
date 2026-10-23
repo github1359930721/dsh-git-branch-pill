@@ -1,0 +1,52 @@
+{
+  "name": "dsh-git-branch-pill",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness Web plugin: shows every Session's Git branch as a live pill in the composer dock, including active conversations.",
+  "type": "module",
+  "license": "MIT",
+  "author": "github1359930721",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/github1359930721/dsh-git-branch-pill.git"
+  },
+  "homepage": "https://github.com/github1359930721/dsh-git-branch-pill#readme",
+  "bugs": {
+    "url": "https://github.com/github1359930721/dsh-git-branch-pill/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "git",
+    "branch"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

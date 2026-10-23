@@ -1,0 +1,5 @@
+# Keep every committed file byte-identical on checkout: this package ships
+# hand-authored JavaScript and JSON that the DSH client loads verbatim.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

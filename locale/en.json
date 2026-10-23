@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "Git Branch Pill",
+    "description": "Shows the Git branch of the current Session's working directory below the composer."
+  },
+  "pill": {
+    "branch": "{branch}",
+    "detached": "detached · {branch}"
+  }
+}

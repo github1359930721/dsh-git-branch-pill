@@ -1,0 +1,10 @@
+{
+  "meta": {
+    "title": "Git 分支胶囊",
+    "description": "在当前会话的输入框下方显示该会话工作目录所在的 Git 分支。"
+  },
+  "pill": {
+    "branch": "{branch}",
+    "detached": "分离 HEAD · {branch}"
+  }
+}
