@@ -88,8 +88,9 @@ for (const [name, ok, actual] of checks) {
   console.log(`${ok ? 'PASS' : 'FAIL'} ${name}: ${String(actual)}`)
 }
 
-// Render with a stub hook seat. Three states must stay distinguishable:
-// no session → nothing, unknown answer → warning pill, known non-repo → nothing.
+// Render with a stub hook seat. Every outcome must stay distinguishable:
+// no session → nothing, unknown answer → warning pill, known non-repo → a
+// muted "not git" pill rather than a vanished seat.
 const render = (cwd) => {
   const useSessions = (selector) => selector({ byId: cwd === undefined ? {} : { 's-1': { cwd } } })
   return registered.component({ useSessions, sessionId: 's-1', t: undefined })
@@ -109,12 +110,20 @@ const noSessionOk = noSession === null || noSession === undefined
 if (!noSessionOk) failed += 1
 console.log(`${noSessionOk ? 'PASS' : 'FAIL'} hides without a session: ${JSON.stringify(noSession)}`)
 
-// A known non-repository renders nothing, so plain folders stay clean.
+// A known non-repository keeps a muted pill, so a plain folder Session never
+// looks like the plugin failed to load.
 globalThis.__seedAnswers?.('D:\\plain-folder', { repo: false, branch: null, detached: false })
 const plain = render('D:\\plain-folder')
-const plainHidden = plain === null || plain === undefined
-if (!plainHidden) failed += 1
-console.log(`${plainHidden ? 'PASS' : 'FAIL'} confirmed non-repository renders nothing`)
+const plainOk = plain !== null && plain !== undefined && plain.props?.state === 'plain'
+if (!plainOk) failed += 1
+console.log(`${plainOk ? 'PASS' : 'FAIL'} confirmed non-repository renders a muted pill`)
+
+// A repository with no resolvable branch (empty repo) also keeps a seat.
+globalThis.__seedAnswers?.('D:\\empty-repo', { repo: true, branch: null, detached: false })
+const noBranch = render('D:\\empty-repo')
+const noBranchOk = noBranch !== null && noBranch !== undefined && noBranch.props?.state === 'plain'
+if (!noBranchOk) failed += 1
+console.log(`${noBranchOk ? 'PASS' : 'FAIL'} repository without a branch renders a muted pill`)
 
 // A known branch renders the label button that offers the copy affordance.
 globalThis.__seedAnswers?.('D:\\repo', { repo: true, branch: 'mzj', detached: false })

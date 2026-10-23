@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Git Branch Pill",
-    "description": "Shows the Git branch of the current Session's working directory below the composer."
+    "description": "Shows the Git branch of every Session's working directory under its composer. A non-Git folder shows a muted \"not git\" pill instead of vanishing, and a click switches branches when git-graph is installed."
   },
   "pill": {
     "branch": "{branch}",

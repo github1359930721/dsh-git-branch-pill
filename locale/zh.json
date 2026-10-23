@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Git 分支胶囊",
-    "description": "在当前会话的输入框下方显示该会话工作目录所在的 Git 分支。"
+    "description": "在每个会话的输入框下方实时显示该会话工作目录的 Git 分支；非 Git 目录显示「非 Git」而不是整块消失，装了 git-graph 后点击即可切换分支。"
   },
   "pill": {
     "branch": "{branch}",

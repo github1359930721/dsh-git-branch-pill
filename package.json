@@ -1,7 +1,7 @@
 {
   "name": "dsh-git-branch-pill",
-  "version": "1.1.0",
-  "description": "DeepSeek Harness Web plugin: shows every Session's Git branch as a live pill in the composer dock, including active conversations.",
+  "version": "1.1.1",
+  "description": "DSH plugin: a live Git branch pill under every Session's composer — it never disappears in a non-Git folder, and switches branches when git-graph is installed.",
   "type": "module",
   "license": "MIT",
   "author": "github1359930721",

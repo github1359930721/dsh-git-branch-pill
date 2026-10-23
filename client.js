@@ -26,6 +26,9 @@ window.__ModuleLoader__.load({
 .gbp-pill:focus-visible{outline:2px solid var(--dsh-accent,#247bbf);outline-offset:1px}
 .gbp-pill[data-state="error"]{color:var(--dsh-warning,#b8860b);border-color:var(--dsh-warning-border,rgba(184,134,11,.45));cursor:default}
 .gbp-pill[data-state="error"]:hover{background:transparent}
+.gbp-pill[data-state="plain"]{color:var(--dsw-alias-label-tertiary,var(--dsh-text-secondary,inherit));border-style:dashed;cursor:default}
+.gbp-pill[data-state="plain"]:hover{background:transparent}
+.gbp-pill[data-state="plain"] .gbp-icon{opacity:.55}
 .gbp-pill[data-state="copied"]{border-color:var(--dsh-accent,#247bbf);color:var(--dsh-accent,#247bbf)}
 .gbp-icon{flex:none;display:block;opacity:.75}
 .gbp-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
@@ -144,8 +147,9 @@ window.__ModuleLoader__.load({
     /**
      * The dock entry itself. Session props give the directory.
      *
-     * Three outcomes stay distinguishable, because "nothing shown" is useless
-     * for diagnosis: a confirmed non-repository renders nothing, a confirmed
+     * Four outcomes stay distinguishable, because "nothing shown" is useless
+     * for diagnosis: a confirmed non-repository renders a muted "not a repo"
+     * pill (so the branch seat never silently disappears), a confirmed
      * repository renders the branch, and an unknown outcome (network, auth,
      * timeout, git not installed) renders a muted warning that says why.
      *
@@ -244,21 +248,10 @@ window.__ModuleLoader__.load({
         )
       }
       if (!answer.repo) {
-        // A confirmed non-repository is not an error: say nothing rather than
-        // clutter every plain folder Session. A missing git and a vanished
-        // directory are actionable, so they get the warning pill.
-        if (answer.reason === 'missing-directory') {
-          return h(
-            PillShell,
-            {
-              state: 'error',
-              title: `${directory}\n${translate('pill.missingDirectory')}`,
-              label: translate('pill.unknownShort'),
-              sessionId,
-            },
-            h(WarningIcon),
-          )
-        }
+        // A confirmed non-repository keeps a muted pill instead of vanishing:
+        // a Session that quietly loses the branch seat is indistinguishable
+        // from a broken plugin. A missing git and a vanished directory are
+        // actionable, so they get the warning pill.
         if (answer.gitMissing === true) {
           return h(
             PillShell,
@@ -271,9 +264,56 @@ window.__ModuleLoader__.load({
             h(WarningIcon),
           )
         }
-        return null
+        if (answer.reason === 'missing-directory') {
+          return h(
+            PillShell,
+            {
+              state: 'error',
+              title: `${directory}\n${translate('pill.missingDirectory')}`,
+              label: translate('pill.unknownShort'),
+              sessionId,
+            },
+            h(WarningIcon),
+          )
+        }
+        if (answer.reason === 'invalid-directory') {
+          return h(
+            PillShell,
+            {
+              state: 'error',
+              title: `${directory}\n${translate('pill.invalidDirectory')}`,
+              label: translate('pill.unknownShort'),
+              sessionId,
+            },
+            h(WarningIcon),
+          )
+        }
+        return h(
+          PillShell,
+          {
+            // Muted, not an error: this directory simply is not versioned.
+            state: 'plain',
+            title: `${directory}\n${translate('pill.notRepository')}`,
+            label: translate('pill.notRepositoryShort'),
+            sessionId,
+          },
+          h(BranchIcon),
+        )
       }
-      if (answer.branch === null) return null
+      if (answer.branch === null) {
+        // A repository we cannot name a branch for (e.g. an empty one that git
+        // cannot resolve): say that instead of leaving an empty seat.
+        return h(
+          PillShell,
+          {
+            state: 'plain',
+            title: `${directory}\n${translate('pill.noBranch')}`,
+            label: translate('pill.noBranchShort'),
+            sessionId,
+          },
+          h(BranchIcon),
+        )
+      }
 
       const label = answer.branch
       const text = translate(answer.detached ? 'pill.detached' : 'pill.branch', { branch: label })
@@ -408,6 +448,11 @@ window.__ModuleLoader__.load({
         'pill.detached': '分离 HEAD · {branch}',
         'pill.unknownShort': '分支未知',
         'pill.unknown': '查询分支失败：网络、登录态或 Host 超时，稍后会自动重试',
+        'pill.notRepositoryShort': '非 Git',
+        'pill.notRepository': '这个工作目录不是 Git 仓库，没有分支可显示',
+        'pill.noBranchShort': '无分支',
+        'pill.noBranch': '这是 Git 仓库，但读不出当前分支（可能是还没有提交的空仓库）',
+        'pill.invalidDirectory': '会话工作目录不是绝对路径，无法查询分支',
         'pill.missingDirectory': '会话工作目录已不存在',
         'pill.gitMissing': '找不到 git 可执行文件：请确认已安装 git 并加入 DSH 进程的 PATH',
         'pill.copyHint': '点击切换分支，Ctrl+点击复制分支名',
@@ -429,6 +474,11 @@ window.__ModuleLoader__.load({
         'pill.detached': 'detached · {branch}',
         'pill.unknownShort': 'branch unknown',
         'pill.unknown': 'Branch lookup failed: network, auth or Host timeout. It retries automatically.',
+        'pill.notRepositoryShort': 'not git',
+        'pill.notRepository': 'This working directory is not a Git repository, so it has no branch',
+        'pill.noBranchShort': 'no branch',
+        'pill.noBranch': 'This is a Git repository but its branch cannot be read (a repository with no commits yet)',
+        'pill.invalidDirectory': 'The Session working directory is not an absolute path, so no branch can be looked up',
         'pill.missingDirectory': 'This Session working directory no longer exists',
         'pill.gitMissing': 'No git executable found: install git and put it on the DSH process PATH',
         'pill.copyHint': 'Click to switch branch, Ctrl+click to copy the name',

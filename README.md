@@ -5,7 +5,25 @@
 
 DeepSeek Harness (DSH) Web 插件：在**每个会话**的输入框下方 dock 里显示该会话工作目录当前的 Git 分支，**包括正在对话的 active 会话**。
 
+两个卖点：
+
+- **所有会话都看得见**，不止新建会话页
+- **非 Git 目录也不会消失** —— 显示灰色的 `⎇ 非 Git`，而不是整块不渲染
+
 修的是「分支名只有新建会话页能看到」的问题：原生 workspace 胶囊和 `@linxin666/dsh-client-ui-git-graph` 的分支选择器都只挂在英雄区（blank 空态）出现，这个胶囊挂在 `conversation.composer.dock`，所以老会话、跑着的会话同样可见。
+
+## 一个会话里能看到的四种状态
+
+「什么都不显示」是最差的反馈：既可能是「这里确实没有分支」，也可能是「插件根本挂了」，两者在界面上完全一样。所以本插件**永远占住一个分支位**：
+
+| 状态 | 界面 | 含义 |
+| --- | --- | --- |
+| 仓库有分支 | `⎇ main` | 正常，可点击复制/切换 |
+| 非 Git 目录 | 灰色虚线 `⎇ 非 Git` | 这个目录没被 git 管，不是错误 |
+| 仓库但没有 HEAD | 灰色虚线 `⎇ 无分支` | 空仓库（还没有第一次提交） |
+| 查询失败 | 黄色 `⚠ 分支未知` | 网络 / 401 / Host 超时 / 找不到 git / 路径非法，hover 看原因 |
+
+核心取舍：**宁可显示一个弱化的「没有」，也不要显示一个看不出原因的空白。**
 
 ## 与 git-graph 协作（可选）
 
@@ -26,14 +44,6 @@ DeepSeek Harness (DSH) Web 插件：在**每个会话**的输入框下方 dock �
 
 因此：**git-graph 升级/改动不会破坏胶囊**，卸载它则胶囊自动降级为只读复制，不会报错。探测结果缓存在页面内存里，每会话只探一次。
 
-## 安装
-
-```bash
-dsh plugin --profile web add github:github1359930721/dsh-git-branch-pill
-```
-
-装完**刷新页面**。桌面版（Electron 独占 `desktop` profile）的安装命令见下方。
-
 ## 它做什么
 
 - Host 半（`index.js`）注册 `GET /api/dsh-git-branch?cwd=<绝对路径>[&fresh=1]`，在会话工作目录里跑 `git symbolic-ref --short HEAD`，失败时退回 `rev-parse --short HEAD`（分离 HEAD 显示为 `分离 HEAD · <sha>`）。
@@ -41,17 +51,22 @@ dsh plugin --profile web add github:github1359930721/dsh-git-branch-pill
 - **点击胶囊复制分支名**（hover 有提示，成功后有 1.2s 的「已复制」反馈）。
 - Host 缓存 **2s**（成功）/ 8s（失败），**LRU** 淘汰、最长 256 项；`git` 调用 4s 超时，绝不拖住 UI。
 
-### 三种结果，分得清
+### 四种结果，分得清
 
 「什么都不显示」没法排查，所以状态是分开的：
 
 | 情况 | 界面 | 原因 |
 | --- | --- | --- |
-| 确认是 git 仓库 | `⎇ 分支名`，可点复制 | — |
-| 确认不是仓库 | **不渲染** | 保持普通文件夹会话干净 |
-| 结果未知（网络 / 401 / Host 超时 / git 缺失） | 黄色 `⚠ 分支未知`，hover 说明原因 | 失败可自愈，但不能装死 |
+| 确认是 git 仓库 | `⎇ 分支名`，可点复制/切换 | — |
+| 确认不是仓库 | 灰色虚线 `⎇ 非 Git`，hover 说明，不可点 | 分支位不消失，普通文件夹会话也不会看起来像插件坏了 |
+| 仓库但读不出分支（空仓库） | 灰色虚线 `⎇ 无分支` | 有仓库无 HEAD，仍是正常状态 |
+| 结果未知（网络 / 401 / Host 超时） | 黄色 `⚠ 分支未知`，hover 说明原因 | 失败可自愈，但不能装死 |
 | 工作目录已不存在 | 黄色 `⚠ 分支未知` | 提示目录被删/改名 |
 | 找不到 `git` 可执行文件 | 黄色 `⚠ 分支未知`，提示检查 PATH | Electron 主进程的 PATH 常比终端窄 |
+| 工作目录不是绝对路径 | 黄色 `⚠ 分支未知` | 会话数据异常，值得暴露 |
+
+> 早期版本对「确认不是仓库」直接不渲染，表现为**切到非 git 会话时胶囊整块消失**，
+> 和「插件没加载」无法区分。现在改成弱化的 `非 Git` 胶囊，任何会话的 dock 里都恒有一个分支位。
 
 Host 有一道 5s 的 `AbortSignal.timeout`：否则一个卡住的请求会占住 `inFlight` 去重表，让后续每 3s 的 tick 全部复用这个挂起的 Promise，胶囊**永久静默**。
 
@@ -85,6 +100,8 @@ dsh plugin --profile web add github:github1359930721/dsh-git-branch-pill
 dsh plugin --profile web add /path/to/dsh-git-branch-pill
 ```
 
+装完**刷新页面**。桌面版（Electron 独占 `desktop` profile）的安装命令见下方。
+
 ### 桌面版（Desktop）
 
 Desktop 由 Electron 应用独占 `desktop` profile，普通 `dsh plugin` 会被拒绝，要用应用自带的 CLI：
@@ -114,7 +131,7 @@ dsh plugin --profile <profile> remove dsh-git-branch-pill
 node tests/handler-check.mjs        # 端点：真实仓库 / 非仓库 / 缺失目录 / 相对路径 / 方法
 node tests/host-hardening.mjs       # Host 加固：git 解析、git 缺失上报、LRU 容量压测
 node tests/poll-behavior.mjs        # 切分支可见性：缓存命中 / fresh=1 / TTL 后轮询 / 分离 HEAD
-node tests/client-check.mjs         # client bundle：manifest dsh.client、inject、slot 注册、locale、五种渲染状态
+node tests/client-check.mjs         # client bundle：manifest dsh.client、inject、slot 注册、locale、六种渲染状态
 node tests/bridge-check.mjs         # git-graph 桥接降级：无该插件时点击安全、不渲染菜单
 node tests/composed-row-check.mjs   # 端到端：profile 清单 + 行解析 + 工厂 require 是否都是 seed 模块
 node tests/activation-scan.mjs      # 对比官方插件的清单声明（排查「不渲染」）
@@ -130,15 +147,50 @@ node tests/git-graph-read.mjs  http://127.0.0.1:<port> <目录>   # 真读分支
 
 `handler-check`、`host-hardening` 与 `poll-behavior` 需要本机有 `git`（后者会建临时仓库并真的切分支）；其余纯 Node。
 
-## 两个曾经踩过的坑（改代码前先看）
+## 踩过的坑（改代码前先看）
 
-1. **`dsh.client` 声明不能省**。少了这个块，`dsh-client-modules` 的扫描直接跳过本包，
-   Host 半照样挂载（端点 401 而不是 404），但浏览器端永远不加载 —— 表现为「什么都不显示」。
-2. **`factory(require)` 只能 require 页面 seed 模块**：`react`、`react/jsx-runtime`、`react-dom`、
-   `@deepseek-ai/cordis`、`zod`、`@tanstack/react-virtual`、`@deepseek-ai/dsh-client-store`、
-   `dsh-client-ui-slots`、`dsh-client-ui-primitives`、`dsh-client-ui-dockkit`。
-   `@deepseek-ai/dsh-client-ui-primitives` **不导出 React**，只有顶层 `react` 才是 React。
-   其他依赖只能显式写进 `dsh.client.external`，或改用 Vite 构建产物。
+### 1. 非 Git 会话里胶囊整块消失（v1.1.1 修复）
+
+**现象**：切到一个工作目录不是 git 仓库的会话，分支胶囊直接不见了。看起来像插件没加载、或者宿主更新把插件搞坏了，但别的会话里它明明好好的。
+
+**原因**：早期代码把「确认不是仓库」当成正常情况，在 `!answer.repo` 分支末尾直接 `return null`——组件返回 `null`，dock 里就什么都不占。于是同一个页面里出现两种完全不同的语义，界面上却都是「空白」：
+
+```js
+// 旧代码
+if (!answer.repo) {
+  if (answer.reason === 'missing-directory') return warningPill
+  if (answer.gitMissing === true) return warningPill
+  return null          // ← 非 Git 目录：什么都没渲染
+}
+```
+
+**修复**：非仓库也渲染一个 `data-state="plain"` 的弱化胶囊（灰色、虚线边框、不可点），文案 `非 Git`，hover 带上完整目录路径。同时补上 `invalid-directory` 与「仓库但无分支」两个分支，四态彻底分开。
+
+**教训**：在「多状态合并成一个 dock 位」的 UI 里，**空渲染必须被当成一种错误处理方式**来看待，而不是一种正常输出。只要用户无法区分「无数据」和「无功能」，任何一个状态缺失都会被读成 bug——而这个 bug 又会掩盖真正的 bug。要么渲染占位，要么暴露原因，不要留白。
+
+### 2. `dsh.client` 声明不能省
+
+少了这个块，`dsh-client-modules` 的扫描直接跳过本包，Host 半照样挂载（端点返回 401 而不是 404，看起来一切正常），但浏览器端永远不加载。表现为「界面里什么都没有」。排查时先确认这一条：`dsh.client.platform` 必须是 `web`，并且 `exports["./client"]` 指向真实文件。
+
+### 3. `factory(require)` 只能 require 页面 seed 模块
+
+页面注入的 `require` 只认 shell 预先 seed 的模块：
+
+`react`、`react/jsx-runtime`、`react-dom`、`@deepseek-ai/cordis`、`zod`、`@tanstack/react-virtual`、`@deepseek-ai/dsh-client-store`、`dsh-client-ui-slots`、`dsh-client-ui-primitives`、`dsh-client-ui-dockkit`。
+
+`@deepseek-ai/dsh-client-ui-primitives` **不导出 React**，只有顶层 `react` 才是 React。其他依赖要么显式写进 `dsh.client.external`，要么改成 Vite 构建产物。`tests/composed-row-check.mjs` 就是对这条的自检。
+
+### 4. Host 端 endpoint 永远返回 JSON，不要漏掉鉴权
+
+`requestRejection`（宿主自带的跨站/未登录判定）必须在最前面。漏了它，页面拿不到分支、只在 console 里报一个 fetch 失败，胶囊表现为「分支未知」，很难反查到是认证问题。
+
+### 5. 主题变量名要跟宿主对齐
+
+胶囊的弱化色一度写了 `--dsh-text-tertiary`——宿主根本没有定义这个变量，于是 `plain` 状态静默回退成正文色，看起来跟正常分支一样重。宿主实际用的是 `--dsw-alias-label-tertiary`。**改配色前先在 `dsh-client-ui-*` 的 CSS 里确认变量真的存在**，别按直觉命名。
+
+### 6. 从 GitHub 安装的是快照，不是 junction
+
+`dsh plugin add github:...` 会把包**拷贝**到 `<DSH_HOME>/profiles/<profile>/node_modules/`，不是软链。所以本地改完 `client.js` 后，**必须同步到 profile 目录再刷新页面**，否则你在浏览器里验证的仍然是被改坏的旧版本——这个坑会让人怀疑自己改的代码没生效。
 
 ## 已知限制
 
