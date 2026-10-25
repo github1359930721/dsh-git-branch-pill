@@ -18,6 +18,7 @@ window.__ModuleLoader__.load({
 
     /** Host half route; keep in sync with index.js. */
     const ENDPOINT = '/api/dsh-git-branch'
+    const STATUS_ENDPOINT = '/api/dsh-git-status'
 
     const CSS = `
 .gbp-anchor{display:inline-flex;align-items:center;min-width:0;max-width:min(18rem,50vw)}
@@ -44,12 +45,25 @@ window.__ModuleLoader__.load({
 .gbp-menu-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .gbp-menu-badge{flex:none;font-size:.7rem;opacity:.65}
 .gbp-menu-empty,.gbp-menu-error{padding:.4rem .45rem;font-size:.75rem;opacity:.75}
+.gbp-pill[data-state="stale"]{color:var(--dsh-warning,#b8860b);border-style:dashed}
+.gbp-refresh{border:0;background:transparent;color:inherit;cursor:pointer;padding:.1rem .3rem;font:inherit;font-size:.75rem}
+.gbp-refresh:focus-visible,.gbp-menu-item:focus-visible{outline:2px solid var(--dsh-accent,#247bbf);outline-offset:1px}
+.gbp-refresh:disabled{opacity:.5;cursor:wait}
+.gbp-indicator{flex:none;font-size:.7rem}
+.gbp-menu-actions{display:flex;gap:.3rem}
+.gbp-menu-actions button{width:auto}
+.gbp-menu-status{padding:.2rem .25rem;font-size:.75rem;opacity:.8}
+.gbp-menu-item[data-active="true"]{background:var(--dsh-fill-subtle,rgba(127,127,127,.12))}
 .gbp-menu-error{color:var(--dsh-warning,#b8860b);opacity:1}
 `
 
     /** Cached answers are for immediate display, not for suppressing polls. */
     const answers = new Map()
     const inFlight = new Map()
+    const statusAnswers = new Map()
+    const statusRequests = new Map()
+    const statusRetries = new Map()
+    const STATUS_POLL_MS = 30000
     const ANSWER_LIMIT = 256
 
     const POLL_MS = 3000
@@ -106,6 +120,7 @@ window.__ModuleLoader__.load({
             detached: payload.detached === true,
             reason: typeof payload.reason === 'string' ? payload.reason : null,
             gitMissing: payload.gitMissing === true,
+            updatedAt: Date.now(),
           }
           rememberAnswer(directory, answer)
           return answer
@@ -120,6 +135,51 @@ window.__ModuleLoader__.load({
           if (inFlight.get(directory) === entry) inFlight.delete(directory)
         })
       inFlight.set(directory, entry)
+      return entry.promise
+    }
+
+    function invalidateStatus(directory) {
+      const running = statusRequests.get(directory)
+      statusRequests.delete(directory)
+      statusAnswers.delete(directory)
+      running?.controller.abort()
+    }
+
+    async function readStatus(directory, fresh = false) {
+      if (!fresh && Date.now() < (statusRetries.get(directory) ?? 0)) return undefined
+      const hit = statusAnswers.get(directory)
+      if (!fresh && hit && Date.now() - hit.updatedAt < STATUS_POLL_MS) return hit
+      const running = statusRequests.get(directory)
+      if (running) {
+        if (!fresh || running.fresh) return running.promise
+        invalidateStatus(directory)
+      }
+      const entry = { controller: new AbortController(), fresh }
+      entry.promise = Promise.resolve().then(() => fetch(`${STATUS_ENDPOINT}?cwd=${encodeURIComponent(directory)}${fresh ? '&fresh=1' : ''}`, {
+        credentials: 'same-origin', cache: 'no-store', headers: { accept: 'application/json' },
+        signal: AbortSignal.any([entry.controller.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]),
+      })).then(async response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`)
+        return response.json()
+      }).then(value => {
+        if (statusRequests.get(directory) !== entry) return undefined
+        if (typeof value?.repo !== 'boolean' || value.reason) throw new Error(value?.reason ?? 'invalid status response')
+        if (!['modifiedFiles', 'untrackedFiles', 'conflicts'].every(key => Number.isInteger(value[key]) && value[key] >= 0)) throw new Error('invalid status counts')
+        statusRetries.delete(directory)
+        const status = { ...value, updatedAt: Date.now() }
+        statusAnswers.delete(directory)
+        statusAnswers.set(directory, status)
+        if (statusAnswers.size > ANSWER_LIMIT) statusAnswers.delete(statusAnswers.keys().next().value)
+        return status
+      }).catch(error => {
+        if (statusRequests.get(directory) === entry) {
+          statusRetries.set(directory, Date.now() + STATUS_POLL_MS)
+          if (statusRetries.size > ANSWER_LIMIT) statusRetries.delete(statusRetries.keys().next().value)
+          reportFailure(`status lookup failed (${error?.message ?? error})`)
+        }
+        return undefined
+      }).finally(() => { if (statusRequests.get(directory) === entry) statusRequests.delete(directory) })
+      statusRequests.set(directory, entry)
       return entry.promise
     }
 
@@ -168,6 +228,11 @@ window.__ModuleLoader__.load({
       const [menuOpen, setMenuOpen] = React.useState(false)
       const [anchor, setAnchor] = React.useState(null)
       const [canSwitch, setCanSwitch] = React.useState(false)
+      const [refreshing, setRefreshing] = React.useState(false)
+      const [stale, setStale] = React.useState(false)
+      const [status, setStatus] = React.useState(undefined)
+      const [statusStale, setStatusStale] = React.useState(false)
+      const refreshRef = React.useRef(null)
       const buttonRef = React.useRef(null)
       const activeRef = React.useRef({ directory, live: false })
       activeRef.current.directory = directory
@@ -179,23 +244,62 @@ window.__ModuleLoader__.load({
         setCopied(false)
         setCopyFailed(false)
         setCanSwitch(false)
+        setRefreshing(false)
         if (typeof directory !== 'string' || directory === '') {
           setAnswer(undefined)
           return () => { activeRef.current.live = false }
         }
         let live = true
         let timer
+        let sequence = 0
+        let statusSequence = 0
+        let refreshSequence = 0
+        let hadBridge = false
         setAnswer(answers.get(directory))
-        const tick = (fresh = false) => {
-          readBranch(directory, fresh).then((value) => {
-            if (live && activeRef.current.directory === directory && value !== undefined && answers.get(directory) === value) setAnswer(value)
-          })
+        setStatus(statusAnswers.get(directory))
+        setStale(false)
+        setStatusStale(false)
+        const updateStatus = async (fresh = false) => {
+          const request = ++statusSequence
+          const value = await readStatus(directory, fresh)
+          if (!live || activeRef.current.directory !== directory || request !== statusSequence) return
+          if (value !== undefined) { setStatus(value); setStatusStale(false) }
+          else setStatusStale(true)
+        }
+        const tick = async (fresh = false, manual = false) => {
+          const request = ++sequence
+          const refresh = manual ? ++refreshSequence : null
+          if (manual) setRefreshing(true)
           bridgeAvailable().then((ok) => {
             if (live && activeRef.current.directory === directory) {
+              if (hadBridge && !ok) setMenuOpen(false)
+              hadBridge = ok
               setCanSwitch(ok)
-              if (!ok) setMenuOpen(false)
             }
           })
+          try {
+            const value = await readBranch(directory, fresh)
+            if (!live || activeRef.current.directory !== directory) return
+            if (value !== undefined && answers.get(directory) === value) {
+              const failed = value.reason !== null
+              if (request === sequence) {
+                setAnswer(previous => failed && previous?.repo && previous.branch ? previous : value)
+                setStale(failed)
+              }
+              if (value.repo && !failed) {
+                const hit = statusAnswers.get(directory)
+                if (fresh || ((!hit || Date.now() - hit.updatedAt >= STATUS_POLL_MS) && Date.now() >= (statusRetries.get(directory) ?? 0))) await updateStatus(fresh)
+              } else if (!failed && request === sequence) { setStatus(undefined); setStatusStale(false) }
+            } else if (value === undefined && request === sequence) setStale(true)
+          } finally {
+            if (manual && refresh === refreshSequence && live && activeRef.current.directory === directory) {
+              setRefreshing(false)
+            }
+          }
+        }
+        refreshRef.current = () => {
+          resetBridgeProbe()
+          return tick(true, true)
         }
         const start = () => {
           if (timer !== undefined) return
@@ -220,6 +324,7 @@ window.__ModuleLoader__.load({
         if (typeof window !== 'undefined') window.addEventListener?.('online', onOnline)
         return () => {
           live = false
+          refreshRef.current = null
           activeRef.current.live = false
           stop()
           if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
@@ -239,11 +344,13 @@ window.__ModuleLoader__.load({
 
       if (typeof directory !== 'string' || directory === '') return null
 
+      const retryProps = { onRefresh: () => refreshRef.current?.(), refreshing, refreshLabel: translate('menu.refresh') }
       if (answer === undefined) {
         return h(
           PillShell,
           {
             state: 'error',
+            ...retryProps,
             title: `${directory}\n${translate('pill.unknown')}`,
             label: translate('pill.unknownShort'),
             sessionId,
@@ -261,6 +368,7 @@ window.__ModuleLoader__.load({
             PillShell,
             {
               state: 'error',
+            ...retryProps,
               title: `${directory}\n${translate('pill.gitMissing')}`,
               label: translate('pill.unknownShort'),
               sessionId,
@@ -273,6 +381,7 @@ window.__ModuleLoader__.load({
             PillShell,
             {
               state: 'error',
+            ...retryProps,
               title: `${directory}\n${translate('pill.missingDirectory')}`,
               label: translate('pill.unknownShort'),
               sessionId,
@@ -285,6 +394,7 @@ window.__ModuleLoader__.load({
             PillShell,
             {
               state: 'error',
+            ...retryProps,
               title: `${directory}\n${translate('pill.invalidDirectory')}`,
               label: translate('pill.unknownShort'),
               sessionId,
@@ -302,6 +412,7 @@ window.__ModuleLoader__.load({
           }
           return h(PillShell, {
             state: 'error',
+            ...retryProps,
             title: `${directory}\n${translate(reasons[answer.reason] ?? 'pill.unknown')}`,
             label: translate('pill.unknownShort'),
             sessionId,
@@ -312,6 +423,7 @@ window.__ModuleLoader__.load({
           {
             // Muted, not an error: this directory simply is not versioned.
             state: 'plain',
+            ...retryProps,
             title: `${directory}\n${translate('pill.notRepository')}`,
             label: translate('pill.notRepositoryShort'),
             sessionId,
@@ -326,6 +438,7 @@ window.__ModuleLoader__.load({
           PillShell,
           {
             state: 'plain',
+            ...retryProps,
             title: `${directory}\n${translate('pill.noBranch')}`,
             label: translate('pill.noBranchShort'),
             sessionId,
@@ -360,6 +473,16 @@ window.__ModuleLoader__.load({
         setAnchor(rect === undefined ? null : { left: rect.left, top: rect.top })
         setMenuOpen(true)
       }
+      const lastUpdate = answer.updatedAt === undefined ? '' : new Date(answer.updatedAt).toLocaleTimeString()
+      const staleHint = stale ? `\n${translate('pill.stale', { time: lastUpdate })}` : ''
+      const statusHint = statusStale ? `\n${translate('status.stale')}` : ''
+      const onButtonKey = event => {
+        if (['ArrowDown', 'ContextMenu'].includes(event.key) || (event.key === 'F10' && event.shiftKey)) {
+          event.preventDefault()
+          openMenu()
+        }
+      }
+      const dirty = status?.repo === true && status.dirty === true
       const onClick = (event) => {
         // A1: plain click switches, Ctrl/Cmd+click copies. Without the bridge
         // there is nothing to switch with, so the click copies instead.
@@ -382,24 +505,38 @@ window.__ModuleLoader__.load({
             ref: buttonRef,
             type: 'button',
             className: 'gbp-pill',
-            'data-state': copyFailed ? 'error' : copied ? 'copied' : 'ready',
+            'data-state': copyFailed ? 'error' : copied ? 'copied' : stale ? 'stale' : 'ready',
+            'data-stale': String(stale),
+            'data-dirty': String(dirty),
+            'aria-busy': refreshing,
+            onContextMenu: event => { event.preventDefault(); openMenu() },
+            onKeyDown: onButtonKey,
             'data-git-branch': label,
             'data-switchable': canSwitch ? 'true' : 'false',
-            title: `${directory}\n${text}\n${hint}`,
-            'aria-label': `${text} — ${hint}`,
-            'aria-haspopup': canSwitch ? 'dialog' : undefined,
-            'aria-expanded': canSwitch ? (menuOpen ? 'true' : 'false') : undefined,
+            title: `${directory}\n${text}\n${hint}${staleHint}${statusHint}`,
+            'aria-label': `${text} — ${hint}${staleHint}`,
+            'aria-haspopup': 'dialog',
+            'aria-expanded': menuOpen ? 'true' : 'false',
             onClick,
           },
           // createElement does not flatten an array passed as the third
           // argument into children, so the icon and label go as siblings.
           h(BranchIcon),
           h('span', { className: 'gbp-label', 'aria-live': 'polite', children: translate(copyFailed ? 'pill.copyFailed' : copied ? 'pill.copied' : answer.detached ? 'pill.detached' : 'pill.branch', { branch: label }) }),
+          stale ? h(WarningIcon) : null,
+          dirty ? h('span', { className: 'gbp-indicator', children: `· ${translate('status.dirty')}` }) : null,
+          refreshing ? h('span', { className: 'gbp-indicator', children: '…' }) : null,
           canSwitch ? h(ChevronIcon) : null,
         ),
-        menuOpen && canSwitch
+        menuOpen
           ? h(BranchMenu, {
               directory,
+              canSwitch,
+              status,
+              statusStale,
+              refreshing,
+              onRefresh: () => refreshRef.current?.(),
+              onCopy: copy,
               current: answer.detached ? '' : label,
               anchor,
               translate,
@@ -407,17 +544,20 @@ window.__ModuleLoader__.load({
               onClose: closeMenu,
               onPicked: (name) => {
                 invalidateBranch(directory)
-                const next = { ...answer, branch: name, detached: false }
-                rememberAnswer(directory, next)
+                invalidateStatus(directory)
                 if (!activeRef.current.live || activeRef.current.directory !== directory) return
+                setStatus(undefined)
+                setStatusStale(false)
+                setStale(false)
+                const next = { ...answer, branch: name, detached: false, updatedAt: Date.now() }
+                rememberAnswer(directory, next)
                 closeMenu()
                 setAnswer(next)
-                readBranch(directory, true).then((value) => {
-                  if (activeRef.current.live && activeRef.current.directory === directory && value !== undefined && answers.get(directory) === value) setAnswer(value)
-                })
+                void refreshRef.current?.()
               },
             })
           : null,
+        h('button', { type: 'button', className: 'gbp-refresh', 'aria-label': translate('menu.refresh'), title: translate('menu.refresh'), disabled: refreshing, onClick: () => refreshRef.current?.(), children: refreshing ? '…' : '↻' }),
       )
     }
 
@@ -442,7 +582,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Deliberately dumb shell for the non-ready states. */
-    function PillShell({ state, title, label, sessionId, children }) {
+    function PillShell({ state, title, label, sessionId, children, onRefresh, refreshing, refreshLabel }) {
       return h(
         'span',
         { className: 'gbp-anchor', 'data-composer-stat': 'git-branch', 'data-session': sessionId },
@@ -452,6 +592,7 @@ window.__ModuleLoader__.load({
           children,
           h('span', { className: 'gbp-label', children: label }),
         ),
+        onRefresh ? h('button', { type: 'button', className: 'gbp-refresh', onClick: onRefresh, disabled: refreshing, 'aria-label': refreshLabel, title: refreshLabel, children: refreshing ? '…' : '↻' }) : null,
       )
     }
 
@@ -500,6 +641,16 @@ window.__ModuleLoader__.load({
         'pill.copyHint': '点击切换分支，Ctrl+点击复制分支名',
         'pill.copyHintPlain': '点击复制分支名',
         'pill.copied': '已复制',
+        'pill.stale': '更新失败，显示上次结果；最后成功时间：{time}',
+        'status.dirty': '有改动',
+        'status.stale': '工作区状态更新失败，当前状态可能已过期',
+        'status.unknown': '工作区状态尚未确认',
+        'status.counts': '修改 {modified} · 未跟踪 {untracked} · 冲突 {conflicts}',
+        'menu.actions': '分支操作',
+        'menu.copy': '复制分支名',
+        'menu.refresh': '刷新 / 重试',
+        'menu.refreshing': '正在刷新…',
+        'menu.noMatches': '没有匹配分支',
         'menu.title': '切换分支',
         'menu.loading': '正在读取分支…',
         'menu.empty': '没有本地分支',
@@ -532,6 +683,16 @@ window.__ModuleLoader__.load({
         'pill.copyHint': 'Click to switch branch, Ctrl+click to copy the name',
         'pill.copyHintPlain': 'Click to copy the branch name',
         'pill.copied': 'copied',
+        'pill.stale': 'Update failed; showing the last result. Last success: {time}',
+        'status.dirty': 'modified',
+        'status.stale': 'Worktree status update failed; the previous status may be stale.',
+        'status.unknown': 'Worktree status not yet confirmed',
+        'status.counts': 'Modified {modified} · Untracked {untracked} · Conflicts {conflicts}',
+        'menu.actions': 'Branch actions',
+        'menu.copy': 'Copy branch name',
+        'menu.refresh': 'Refresh / Retry',
+        'menu.refreshing': 'Refreshing…',
+        'menu.noMatches': 'No matching branches',
         'menu.title': 'Switch branch',
         'menu.loading': 'Reading branches…',
         'menu.empty': 'No local branches',
@@ -653,7 +814,10 @@ window.__ModuleLoader__.load({
      * Branch picker. Rendered into a fixed-position layer so the composer's
      * own stacking context cannot clip it; closes on Escape or an outside click.
      */
-    function BranchMenu({ directory, current, anchor, onPicked, onClose, translate }) {
+    function BranchMenu({ directory, current, anchor, onPicked, onClose, translate, canSwitch = true, onCopy, onRefresh, refreshing, status, statusStale }) {
+      const [revision, setRevision] = React.useState(0)
+      const [active, setActive] = React.useState(null)
+      const itemRefs = React.useRef(new Map())
       const [state, setState] = React.useState({ phase: 'loading', branches: [], error: null })
       const [filter, setFilter] = React.useState('')
       const [busy, setBusy] = React.useState(null)
@@ -668,22 +832,26 @@ window.__ModuleLoader__.load({
         setState({ phase: 'loading', branches: [], error: null })
         setBusy(null)
         menuRef.current.busy = false
+        if (!canSwitch) { setState({ phase: 'ready', branches: [], error: null }); return () => { menuRef.current.live = false } }
         listBranches(directory).then((view) => {
           if (!live) return
           if (view === null) {
             setState({ phase: 'error', branches: [], error: translate('menu.unavailable') })
             return
           }
-          setState({ phase: 'ready', branches: view.branches ?? [], error: null })
+          setState({ phase: 'ready', branches: Array.isArray(view.branches) ? view.branches.filter(row => typeof row?.name === 'string') : [], error: null })
         })
         return () => {
           live = false
           menuRef.current.live = false
         }
-      }, [directory])
+      }, [directory, canSwitch, revision])
 
       React.useEffect(() => {
         inputRef.current?.focus()
+      }, [])
+
+      React.useEffect(() => {
         const onKey = (event) => {
           if (event.key === 'Escape') {
             event.stopPropagation()
@@ -718,7 +886,30 @@ window.__ModuleLoader__.load({
         setState((previous) => ({ ...previous, error: translate('menu.failed', { message: result.message }) }))
       }
 
-      const items = state.branches.filter((row) => filter === '' || row.name.toLowerCase().includes(filter.trim().toLowerCase()))
+      const items = state.branches.filter((row) => row.name === current || filter.trim() === '' || row.name.toLowerCase().includes(filter.trim().toLowerCase()))
+        .sort((a, b) => Number(b.name === current) - Number(a.name === current))
+      const matches = items.filter(row => row.name !== current)
+      const onNavigate = event => {
+        if (menuRef.current.busy) return
+        const navigable = matches
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+          if (!navigable.length) return
+          event.preventDefault()
+          event.stopPropagation()
+          const index = navigable.findIndex(row => row.name === active)
+          const next = index < 0 ? (event.key === 'ArrowDown' ? 0 : navigable.length - 1) : (index + (event.key === 'ArrowDown' ? 1 : -1) + navigable.length) % navigable.length
+          setActive(navigable[next].name)
+          itemRefs.current.get(navigable[next].name)?.focus()
+        } else if (event.key === 'Enter' && event.target === inputRef.current) {
+          const row = navigable.find(row => row.name === active) ?? navigable[0]
+          if (row) { event.preventDefault(); void pick(row.name) }
+        }
+      }
+      const refresh = () => {
+        if (menuRef.current.busy || refreshing) return
+        void onRefresh?.()
+        setRevision(value => value + 1)
+      }
       const style = anchor === null ? { position: 'fixed', left: 24, bottom: 120 } : {
         position: 'fixed',
         left: Math.max(8, Math.min(anchor.left, (typeof window === 'undefined' ? anchor.left : window.innerWidth) - 320)),
@@ -734,22 +925,29 @@ window.__ModuleLoader__.load({
           role: 'dialog',
           'aria-label': translate('menu.title'),
           'data-git-branch-menu': 'true',
+          onKeyDown: onNavigate,
         },
-        h('div', { className: 'gbp-menu-title', children: translate('menu.title') }),
-        h('input', {
+        h('div', { className: 'gbp-menu-title', children: translate(canSwitch ? 'menu.title' : 'menu.actions') }),
+        canSwitch && filter.trim() && matches.length === 0 ? h('div', { className: 'gbp-menu-empty', children: translate('menu.noMatches') }) : null,
+        h('div', { className: 'gbp-menu-actions' },
+          h('button', { type: 'button', className: 'gbp-menu-item', onClick: () => { void onCopy?.(); onClose() }, children: translate('menu.copy') }),
+          h('button', { type: 'button', className: 'gbp-menu-item', disabled: refreshing || busy !== null, onClick: refresh, children: translate(refreshing ? 'menu.refreshing' : 'menu.refresh') }),
+        ),
+        h('div', { className: 'gbp-menu-status', 'aria-live': 'polite', children: statusStale ? translate('status.stale') : status?.repo ? translate('status.counts', { modified: status.modifiedFiles, untracked: status.untrackedFiles, conflicts: status.conflicts }) : translate('status.unknown') }),
+        canSwitch ? h('input', {
           ref: inputRef,
           className: 'gbp-menu-filter',
           type: 'search',
           value: filter,
           placeholder: translate('menu.filter'),
           'aria-label': translate('menu.filter'),
-          onChange: (event) => setFilter(event.target.value),
-        }),
+          onChange: (event) => { setFilter(event.target.value); setActive(null) },
+        }) : null,
         state.error !== null ? h('div', { className: 'gbp-menu-error', role: 'alert', children: state.error }) : null,
-        state.phase === 'loading'
+        !canSwitch ? h('div', { className: 'gbp-menu-empty', children: translate('menu.unavailable') }) : state.phase === 'loading'
           ? h('div', { className: 'gbp-menu-empty', children: translate('menu.loading') })
           : items.length === 0
-            ? h('div', { className: 'gbp-menu-empty', children: translate('menu.empty') })
+            ? h('div', { className: 'gbp-menu-empty', children: translate(filter.trim() ? 'menu.noMatches' : 'menu.empty') })
             : h(
                 'ul',
                 { className: 'gbp-menu-list' },
@@ -762,6 +960,10 @@ window.__ModuleLoader__.load({
                       {
                         type: 'button',
                         className: 'gbp-menu-item',
+                        title: row.name,
+                        ref: node => { if (node) itemRefs.current.set(row.name, node); else itemRefs.current.delete(row.name) },
+                        'data-active': String(active === row.name),
+                        onFocus: () => setActive(row.name),
                         'data-current': row.name === current ? 'true' : 'false',
                         disabled: busy !== null || row.name === current,
                         onClick: () => pick(row.name),

@@ -5,12 +5,13 @@ const root = fileURLToPath(new URL('../', import.meta.url))
 const commands = [
   ['--check', 'index.js'],
   ['--check', 'client.js'],
-  ['--experimental-vm-modules', '--test', 'tests/client-behavior.mjs', 'tests/host-behavior.mjs'],
+  ['--experimental-vm-modules', '--test', 'tests/client-behavior.mjs', 'tests/host-behavior.mjs', 'tests/client-enhancements.mjs', 'tests/status-behavior.mjs'],
   ['tests/client-check.mjs'],
   ['tests/bridge-check.mjs'],
   ['tests/handler-check.mjs'],
   ['tests/host-hardening.mjs'],
   ['tests/poll-behavior.mjs'],
+  ['--test', 'tests/status-integration.mjs'],
 ]
 for (const args of commands) {
   console.log(`\n> node ${args.join(' ')}`)

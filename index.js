@@ -10,6 +10,8 @@ import { performance } from 'node:perf_hooks'
 export const inject = ['webServer', 'connection']
 
 const ENDPOINT = '/api/dsh-git-branch'
+const STATUS_ENDPOINT = '/api/dsh-git-status'
+const STATUS_TTL_MS = 30_000
 const CACHE_TTL_MS = 2_000
 const FAILURE_TTL_MS = 8_000
 /** Whole lookup budget, including stat, executable resolution and all commands. */
@@ -63,11 +65,11 @@ export function apply(ctx) {
     return entry.value
   }
 
-  const remember = (key, value) => {
+  const remember = (key, value, status = false) => {
     cache.delete(key)
     if (cache.size >= CACHE_LIMIT) cache.delete(cache.keys().next().value)
     cache.set(key, {
-      value, at: performance.now(), ttl: value.repo ? CACHE_TTL_MS : FAILURE_TTL_MS,
+      value, at: performance.now(), ttl: value.repo && !value.reason ? (status ? STATUS_TTL_MS : CACHE_TTL_MS) : FAILURE_TTL_MS,
     })
   }
 
@@ -114,7 +116,7 @@ export function apply(ctx) {
     signal.addEventListener('abort', aborted, { once: true })
     try {
       child = execFile(executable, argv, {
-        cwd, timeout: remaining, killSignal: 'SIGKILL', windowsHide: true, maxBuffer: 64 * 1024,
+        cwd, timeout: remaining, killSignal: 'SIGKILL', windowsHide: true, maxBuffer: argv.includes('status') ? 4 * 1024 * 1024 : 64 * 1024,
         // Stable diagnostics make nonrepo/safe.directory classification reliable.
         env: { ...process.env, LC_ALL: 'C', LANG: 'C', GIT_TERMINAL_PROMPT: '0' },
       }, (error, stdout, stderr) => {
@@ -166,7 +168,32 @@ export function apply(ctx) {
     return { repo: true, branch: sha.slice(0, 7), detached: true }
   }
 
-  const queryDirectory = async (directory, task) => {
+  const readStatus = async (cwd, task) => {
+    const executable = await resolveGit(task.controller.signal)
+    const result = await git(cwd, executable, ['--no-optional-locks', 'status', '--porcelain=v1', '-z', '--untracked-files=normal'], task)
+    const status = { repo: true, dirty: false, modifiedFiles: 0, untrackedFiles: 0, conflicts: 0 }
+    if (result.error?.code === 128 && /^fatal: (?:not a git repository|this operation must be run in a work tree)/m.test(result.stderr)) return { ...status, repo: false }
+    if (result.error) requireSuccess(result)
+    const entries = result.stdout.split('\0')
+    if (entries.pop() !== '') throw failure('git-failed')
+    const conflicts = new Set(['DD', 'AU', 'UD', 'UA', 'DU', 'AA', 'UU'])
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index]
+      if (entry.length < 4 || entry[2] !== ' ') throw failure('git-failed')
+      const code = entry.slice(0, 2)
+      if (code === '??') status.untrackedFiles++
+      else if (code === '!!') continue
+      else if (conflicts.has(code)) status.conflicts++
+      else status.modifiedFiles++
+      if (/[RC]/.test(code)) {
+        if (++index >= entries.length) throw failure('git-failed')
+      }
+    }
+    status.dirty = status.modifiedFiles + status.untrackedFiles + status.conflicts > 0
+    return status
+  }
+
+  const queryDirectory = async (directory, task, status = false) => {
     let info
     try {
       info = await waitFor(stat(directory), task.controller.signal)
@@ -178,22 +205,22 @@ export function apply(ctx) {
     }
     task.controller.signal.throwIfAborted()
     if (!info.isDirectory()) return answerFor('missing-directory')
-    return readBranch(directory, task)
+    return status ? readStatus(directory, task) : readBranch(directory, task)
   }
 
-  const startLookup = (key, directory, fresh) => {
+  const startLookup = (key, directory, fresh, status) => {
     const task = {
       controller: new AbortController(), deadline: performance.now() + GIT_TIMEOUT_MS,
       users: 0, settled: false, fresh,
     }
     const timer = setTimeout(() => task.controller.abort(failure('git-timeout')), GIT_TIMEOUT_MS)
     inFlight.set(key, task)
-    task.promise = queryDirectory(directory, task).catch((error) => {
+    task.promise = queryDirectory(directory, task, status).catch((error) => {
       if (task.controller.signal.aborted) throw task.controller.signal.reason
       return answerFor(error?.reason ?? 'git-failed')
     }).then((answer) => {
       task.controller.signal.throwIfAborted()
-      remember(key, answer)
+      remember(key, answer, status)
       return answer
     }).finally(() => {
       task.settled = true
@@ -220,11 +247,11 @@ export function apply(ctx) {
     }
   }
 
-  const lookup = async (directory, fresh, signal) => {
+  const lookup = async (directory, fresh, signal, status = false) => {
     signal.throwIfAborted()
     if (!isAbsolute(directory)) return answerFor('invalid-directory')
     const normalized = resolve(directory)
-    const key = process.platform === 'win32' ? normalized.toLowerCase() : normalized
+    const key = `${status ? 'status:' : 'branch:'}${process.platform === 'win32' ? normalized.toLowerCase() : normalized}`
     for (;;) {
       signal.throwIfAborted()
       const running = inFlight.get(key)
@@ -239,7 +266,7 @@ export function apply(ctx) {
         const hit = cached(key)
         if (hit !== undefined) return hit
       }
-      return subscribe(key, startLookup(key, normalized, fresh), signal)
+      return subscribe(key, startLookup(key, normalized, fresh, status), signal)
     }
   }
 
@@ -282,7 +309,7 @@ export function apply(ctx) {
     response.on?.('close', responseClosed)
     const timer = setTimeout(() => controller.abort(failure('git-timeout')), GIT_TIMEOUT_MS)
     try {
-      return send(200, await lookup(directory, url.searchParams.get('fresh') === '1', controller.signal))
+      return send(200, await lookup(directory, url.searchParams.get('fresh') === '1', controller.signal, url.pathname === STATUS_ENDPOINT))
     } catch (error) {
       if (disconnected) return
       if (error?.reason === 'git-timeout') return send(200, answerFor('git-timeout'))
@@ -297,8 +324,10 @@ export function apply(ctx) {
   }
 
   ctx.effect(() => {
+    const unregisterStatus = ctx.webServer.register({ kind: 'exact', path: STATUS_ENDPOINT, handler })
     const unregister = ctx.webServer.register({ kind: 'exact', path: ENDPOINT, handler })
     return () => {
+      unregisterStatus()
       unregister()
       for (const task of inFlight.values()) task.controller.abort(failure('cancelled'))
       inFlight.clear()

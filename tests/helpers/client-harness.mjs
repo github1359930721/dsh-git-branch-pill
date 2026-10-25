@@ -84,7 +84,7 @@ export function clientHarness(fetch, options = {}) {
     Date: class extends Date { static now() { return now } },
     AbortSignal,
     AbortController,
-    fetch,
+    fetch: (url, init) => options.statusFetch && String(url).startsWith('/api/dsh-git-status') ? options.statusFetch(url, init) : String(url).startsWith('/api/dsh-git-status') ? Promise.resolve(response({ repo: true, dirty: false, modifiedFiles: 0, untrackedFiles: 0, conflicts: 0 })) : fetch(url, init),
     navigator: { clipboard: options.clipboard, platform: 'Win32' },
     setInterval: (fn, delay) => schedule(fn, delay, true),
     clearInterval: id => timers.delete(id),
@@ -99,9 +99,14 @@ export function clientHarness(fetch, options = {}) {
     if (node.props?.ref && node.props.ref.current === null) {
       node.props.ref.current = {
         focus() { focused.push(node.type) },
+        scrollIntoView() {},
         contains(target) { return target === this },
         getBoundingClientRect: () => ({ left: 24, top: 120 }),
       }
+    }
+    if (typeof node.props?.ref === 'function') {
+      const element = { focus() { focused.push(node.props.title ?? node.type) }, scrollIntoView() {} }
+      node.props.ref(element)
     }
     for (const child of node.children ?? []) {
       if (Array.isArray(child)) child.forEach(attachRefs)
