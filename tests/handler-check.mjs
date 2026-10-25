@@ -1,67 +1,57 @@
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { apply } from '../index.js'
 
+const fixture = mkdtempSync(join(tmpdir(), 'gbp-handler-'))
+const repo = join(fixture, 'repo')
+const subdir = join(repo, 'subdir')
+const plain = join(fixture, 'plain')
+mkdirSync(repo)
+mkdirSync(subdir)
+mkdirSync(plain)
+
 let registered
-const ctx = {
-  get: () => undefined,
+apply({
+  get: key => key === 'connection' ? { requestRejection: () => undefined } : undefined,
   logger: { warn: (...args) => console.error('[warn]', ...args) },
-  webServer: {
-    register: (route) => {
-      registered = route
-      return () => {}
-    },
-  },
-  effect: (fn) => fn(),
-}
+  webServer: { register: route => { registered = route; return () => {} } },
+  effect: fn => fn(),
+})
 
-apply(ctx)
-
-const call = (url, method = 'GET') =>
-  new Promise((resolve) => {
-    const response = {
-      writeHead: (status, headers) => {
-        response._status = status
-        response._headers = headers
-      },
-      end: (body) => resolve({ status: response._status, body: JSON.parse(body) }),
-    }
-    Promise.resolve(registered.handler({ method, url }, response))
+const call = async (url, method = 'GET') => {
+  let status, body
+  await registered.handler({ method, url }, {
+    writeHead: code => { status = code },
+    end: text => { body = JSON.parse(text) },
   })
-
-const withTimeout = (promise, ms) =>
-  Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve({ status: 'TIMEOUT' }), ms))])
-
-const query = (cwd) => `/api/dsh-git-branch?cwd=${encodeURIComponent(cwd)}`
-
-const cases = [
-  ['own repo (IM-APP)', query('D:\\project\\go\\IM-APP'), 'GET', 'repo'],
-  ['own repo (subdir)', query('D:\\project\\go\\IM-APP\\IM-APP-fronend'), 'GET', 'repo'],
-  ['non-repo (home)', query('C:\\Users\\zbjt'), 'GET', 'no-repo'],
-  ['missing dir', query('D:\\nope\\nope'), 'GET', 'no-repo'],
-  ['relative dir', query('relative/path'), 'GET', 'no-repo'],
-  ['no cwd param', '/api/dsh-git-branch', 'GET', 400],
-  ['POST method', '/api/dsh-git-branch', 'POST', 405],
-]
-
-let failed = 0
-for (const [name, url, method, kind] of cases) {
-  const result = await withTimeout(call(url, method), 8000)
-  if (result.status === 'TIMEOUT') {
-    failed += 1
-    console.log(`FAIL ${name}: timed out`)
-    continue
-  }
-  const rendered = JSON.stringify(result)
-  let ok
-  if (kind === 'repo') {
-    ok = result.status === 200 && result.body.repo === true && typeof result.body.branch === 'string' && result.body.branch !== ''
-  } else if (kind === 'no-repo') {
-    ok = result.status === 200 && result.body.repo === false && result.body.branch === null
-  } else {
-    ok = result.status === kind
-  }
-  if (!ok) failed += 1
-  console.log(`${ok ? 'PASS' : 'FAIL'} ${name}: ${rendered}`)
+  return { status, body }
 }
-
+const query = cwd => `/api/dsh-git-branch?cwd=${encodeURIComponent(cwd)}`
+let failed = 0
+try {
+  execFileSync('git', ['init', '--initial-branch=main', repo], { stdio: 'ignore' })
+  const cases = [
+    ['repository', query(repo), 'GET', 'main'],
+    ['repository subdirectory', query(subdir), 'GET', 'main'],
+    ['nonrepository', query(plain), 'GET', 'plain'],
+    ['missing directory', query(join(fixture, 'missing')), 'GET', 'missing-directory'],
+    ['relative directory', query('relative/path'), 'GET', 'invalid-directory'],
+    ['no cwd', '/api/dsh-git-branch', 'GET', 400],
+    ['POST', '/api/dsh-git-branch', 'POST', 405],
+  ]
+  for (const [name, url, method, expected] of cases) {
+    const result = await call(url, method)
+    const ok = typeof expected === 'number' ? result.status === expected
+      : expected === 'main' ? result.status === 200 && result.body.repo === true && result.body.branch === 'main'
+        : expected === 'plain' ? result.status === 200 && result.body.repo === false && result.body.reason === undefined
+          : result.status === 200 && result.body.reason === expected
+    if (!ok) failed++
+    console.log(`${ok ? 'PASS' : 'FAIL'} ${name}: ${JSON.stringify(result)}`)
+  }
+} finally {
+  rmSync(fixture, { recursive: true, force: true })
+}
 console.log(failed === 0 ? 'ALL PASS' : `${failed} FAILED`)
-process.exit(failed === 0 ? 0 : 1)
+process.exitCode = failed === 0 ? 0 : 1

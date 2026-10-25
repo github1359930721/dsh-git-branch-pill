@@ -34,7 +34,7 @@ try {
   // Mount the Host half against a stub context, then drive its handler.
   let registered
   apply({
-    get: () => undefined,
+    get: (key) => key === 'connection' ? { requestRejection: () => undefined } : undefined,
     logger: { warn: (...args) => console.error('[warn]', ...args) },
     webServer: {
       register: (route) => {

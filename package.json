@@ -1,8 +1,12 @@
 {
   "name": "dsh-git-branch-pill",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Show the Git branch under every DSH Session's composer, and switch it when git-graph is installed.",
   "type": "module",
+  "scripts": {
+    "test": "node tests/run.mjs",
+    "test:behavior": "node --experimental-vm-modules --test tests/client-behavior.mjs tests/host-behavior.mjs"
+  },
   "license": "MIT",
   "author": "github1359930721",
   "repository": {

@@ -47,78 +47,80 @@ window.__ModuleLoader__.load({
 .gbp-menu-error{color:var(--dsh-warning,#b8860b);opacity:1}
 `
 
-    /** Session-scoped answer cache: one Session asks for one directory. */
+    /** Cached answers are for immediate display, not for suppressing polls. */
     const answers = new Map()
     const inFlight = new Map()
+    const ANSWER_LIMIT = 256
 
-    /**
-     * Poll interval. A `git checkout` is picked up within one tick; the Host
-     * answers from a 2s cache, so a tick usually spawns no child process.
-     */
     const POLL_MS = 3000
-
-    /** A stuck Host must not pin the shared in-flight promise forever. */
     const FETCH_TIMEOUT_MS = 5000
 
-    /** Once per distinct failure: a 3s poll would otherwise flood the console. */
     const reportedFailures = new Set()
 
-    /** Record a failure once, so repeated polls stay quiet in the console. */
     function reportFailure(reason) {
       if (reportedFailures.has(reason)) return
       reportedFailures.add(reason)
       console.error(`[git-branch-pill] ${reason}`)
     }
 
-    /**
-     * Fetch one directory's branch, sharing an in-flight request per directory.
-     *
-     * Resolves `{repo:false}` for a confirmed non-repository and `undefined`
-     * for an unknown outcome (network, auth, timeout, missing git). The two must
-     * stay distinguishable: only the second is worth showing as an error.
-     */
+    function rememberAnswer(directory, answer) {
+      answers.delete(directory)
+      answers.set(directory, answer)
+      if (answers.size > ANSWER_LIMIT) answers.delete(answers.keys().next().value)
+    }
+
+    function invalidateBranch(directory) {
+      const running = inFlight.get(directory)
+      inFlight.delete(directory)
+      running?.controller.abort()
+    }
+
+    /** Share pending reads, but never let an older read overwrite a switch. */
     async function readBranch(directory, fresh = false) {
       if (typeof directory !== 'string' || directory === '') return undefined
-      const key = `${fresh ? 'fresh:' : ''}${directory}`
-      if (!fresh) {
-        const hit = answers.get(directory)
-        if (hit !== undefined) return hit
+      const running = inFlight.get(directory)
+      if (running !== undefined) {
+        if (!fresh || running.fresh) return running.promise
+        invalidateBranch(directory)
       }
-      const running = inFlight.get(key)
-      if (running !== undefined) return running
+      const controller = new AbortController()
+      const entry = { controller, fresh }
       const query = `cwd=${encodeURIComponent(directory)}${fresh ? '&fresh=1' : ''}`
-      const request = fetch(`${ENDPOINT}?${query}`, {
-        cache: 'no-store',
-        credentials: 'same-origin',
-        headers: { accept: 'application/json' },
-        // Without this a stalled Host pins the shared promise and every later
-        // tick reuses it, so the pill would go permanently silent.
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      })
+      entry.promise = Promise.resolve()
+        .then(() => fetch(`${ENDPOINT}?${query}`, {
+          cache: 'no-store',
+          credentials: 'same-origin',
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)]),
+        }))
         .then(async (response) => {
           if (!response.ok) throw new Error(`HTTP ${response.status}`)
           return await response.json()
         })
         .then((payload) => {
+          if (inFlight.get(directory) !== entry) return undefined
+          if (typeof payload?.repo !== 'boolean') throw new Error('invalid branch response')
           const answer = {
-            repo: payload?.repo === true,
-            branch: typeof payload?.branch === 'string' && payload.branch !== '' ? payload.branch : null,
-            detached: payload?.detached === true,
-            reason: typeof payload?.reason === 'string' ? payload.reason : null,
-            gitMissing: payload?.gitMissing === true,
+            repo: payload.repo,
+            branch: typeof payload.branch === 'string' && payload.branch !== '' ? payload.branch : null,
+            detached: payload.detached === true,
+            reason: typeof payload.reason === 'string' ? payload.reason : null,
+            gitMissing: payload.gitMissing === true,
           }
-          // Always overwrite: a poll is how a branch switch becomes visible.
-          answers.set(directory, answer)
-          if (answer.repo) reportedFailures.delete('lookup')
+          rememberAnswer(directory, answer)
           return answer
         })
         .catch((error) => {
-          reportFailure(`branch lookup failed (${error?.name ?? 'Error'}: ${error?.message ?? error})`)
+          if (inFlight.get(directory) === entry) {
+            reportFailure(`branch lookup failed (${error?.name ?? 'Error'}: ${error?.message ?? error})`)
+          }
           return undefined
         })
-        .finally(() => inFlight.delete(key))
-      inFlight.set(key, request)
-      return request
+        .finally(() => {
+          if (inFlight.get(directory) === entry) inFlight.delete(directory)
+        })
+      inFlight.set(directory, entry)
+      return entry.promise
     }
 
     /** Small monochrome branch glyph drawn inline so no icon package is needed. */
@@ -162,51 +164,43 @@ window.__ModuleLoader__.load({
       const directory = useSessions((snapshot) => (sessionId === undefined ? undefined : snapshot.byId[sessionId]?.cwd))
       const [answer, setAnswer] = React.useState(() => (typeof directory === 'string' ? answers.get(directory) : undefined))
       const [copied, setCopied] = React.useState(false)
+      const [copyFailed, setCopyFailed] = React.useState(false)
       const [menuOpen, setMenuOpen] = React.useState(false)
       const [anchor, setAnchor] = React.useState(null)
       const [canSwitch, setCanSwitch] = React.useState(false)
       const buttonRef = React.useRef(null)
-      // Passed down from `apply` so the component stays testable on its own.
+      const activeRef = React.useRef({ directory, live: false })
+      activeRef.current.directory = directory
       const translate = t ?? fallbackTranslate
 
-      // Probe the git-graph bridge once per directory: it decides whether a
-      // click opens the picker or merely copies the branch name.
       React.useEffect(() => {
-        if (typeof directory !== 'string' || directory === '') return undefined
-        let live = true
-        bridgeAvailable().then((ok) => {
-          if (live) setCanSwitch(ok)
-        })
-        return () => {
-          live = false
-        }
-      }, [directory])
-
-      React.useEffect(() => {
+        activeRef.current.live = true
+        setMenuOpen(false)
+        setCopied(false)
+        setCopyFailed(false)
+        setCanSwitch(false)
         if (typeof directory !== 'string' || directory === '') {
           setAnswer(undefined)
-          return undefined
+          return () => { activeRef.current.live = false }
         }
         let live = true
         let timer
-        // Show the cached value immediately, then keep asking. The first tick is
-        // forced past the Host cache so a branch switched while this Session was
-        // not on screen resolves at once; later ticks ride the cache.
         setAnswer(answers.get(directory))
-        let first = true
-        const tick = () => {
-          const fresh = first
-          first = false
+        const tick = (fresh = false) => {
           readBranch(directory, fresh).then((value) => {
-            // `undefined` means "unknown now"; keep the last good answer rather
-            // than blanking a pill that was correct a second ago.
-            if (live && value !== undefined) setAnswer(value)
+            if (live && activeRef.current.directory === directory && value !== undefined && answers.get(directory) === value) setAnswer(value)
+          })
+          bridgeAvailable().then((ok) => {
+            if (live && activeRef.current.directory === directory) {
+              setCanSwitch(ok)
+              if (!ok) setMenuOpen(false)
+            }
           })
         }
         const start = () => {
           if (timer !== undefined) return
-          tick()
-          timer = setInterval(tick, POLL_MS)
+          tick(true)
+          timer = setInterval(() => tick(), POLL_MS)
         }
         const stop = () => {
           if (timer === undefined) return
@@ -217,21 +211,31 @@ window.__ModuleLoader__.load({
           if (typeof document !== 'undefined' && document.hidden) stop()
           else start()
         }
+        const onOnline = () => {
+          resetBridgeProbe()
+          if (typeof document === 'undefined' || !document.hidden) tick(true)
+        }
         if (typeof document === 'undefined' || !document.hidden) start()
         if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
+        if (typeof window !== 'undefined') window.addEventListener?.('online', onOnline)
         return () => {
           live = false
+          activeRef.current.live = false
           stop()
           if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
+          if (typeof window !== 'undefined') window.removeEventListener?.('online', onOnline)
         }
       }, [directory])
 
-      // The "copied" border fades on its own; no timer outlives the component.
       React.useEffect(() => {
-        if (!copied) return undefined
-        const timer = setTimeout(() => setCopied(false), 1200)
+        if (answer === undefined || !answer.repo || answer.branch === null) setMenuOpen(false)
+      }, [answer])
+
+      React.useEffect(() => {
+        if (!copied && !copyFailed) return undefined
+        const timer = setTimeout(() => { setCopied(false); setCopyFailed(false) }, 1200)
         return () => clearTimeout(timer)
-      }, [copied])
+      }, [copied, copyFailed])
 
       if (typeof directory !== 'string' || directory === '') return null
 
@@ -288,6 +292,21 @@ window.__ModuleLoader__.load({
             h(WarningIcon),
           )
         }
+        if (answer.reason !== null && answer.reason !== undefined) {
+          const reasons = {
+            'git-timeout': 'pill.gitTimeout',
+            'git-permission-denied': 'pill.gitPermissionDenied',
+            'git-failed': 'pill.gitFailed',
+            'directory-permission-denied': 'pill.directoryPermissionDenied',
+            'directory-unavailable': 'pill.directoryUnavailable',
+          }
+          return h(PillShell, {
+            state: 'error',
+            title: `${directory}\n${translate(reasons[answer.reason] ?? 'pill.unknown')}`,
+            label: translate('pill.unknownShort'),
+            sessionId,
+          }, h(WarningIcon))
+        }
         return h(
           PillShell,
           {
@@ -317,12 +336,24 @@ window.__ModuleLoader__.load({
 
       const label = answer.branch
       const text = translate(answer.detached ? 'pill.detached' : 'pill.branch', { branch: label })
-      const copy = () => {
-        if (typeof navigator === 'undefined' || navigator.clipboard === undefined) return
-        navigator.clipboard.writeText(label).then(
-          () => setCopied(true),
-          () => undefined,
-        )
+      const copy = async () => {
+        try {
+          if (typeof navigator === 'undefined' || navigator.clipboard === undefined) throw new Error('clipboard unavailable')
+          await navigator.clipboard.writeText(label)
+          if (activeRef.current.live && activeRef.current.directory === directory) {
+            setCopyFailed(false)
+            setCopied(true)
+          }
+        } catch {
+          if (activeRef.current.live && activeRef.current.directory === directory) {
+            setCopied(false)
+            setCopyFailed(true)
+          }
+        }
+      }
+      const closeMenu = (restoreFocus = true) => {
+        setMenuOpen(false)
+        if (restoreFocus) buttonRef.current?.focus()
       }
       const openMenu = () => {
         const rect = buttonRef.current?.getBoundingClientRect?.()
@@ -351,7 +382,7 @@ window.__ModuleLoader__.load({
             ref: buttonRef,
             type: 'button',
             className: 'gbp-pill',
-            'data-state': copied ? 'copied' : 'ready',
+            'data-state': copyFailed ? 'error' : copied ? 'copied' : 'ready',
             'data-git-branch': label,
             'data-switchable': canSwitch ? 'true' : 'false',
             title: `${directory}\n${text}\n${hint}`,
@@ -363,7 +394,7 @@ window.__ModuleLoader__.load({
           // createElement does not flatten an array passed as the third
           // argument into children, so the icon and label go as siblings.
           h(BranchIcon),
-          h('span', { className: 'gbp-label', children: copied ? translate('pill.copied') : text }),
+          h('span', { className: 'gbp-label', 'aria-live': 'polite', children: translate(copyFailed ? 'pill.copyFailed' : copied ? 'pill.copied' : answer.detached ? 'pill.detached' : 'pill.branch', { branch: label }) }),
           canSwitch ? h(ChevronIcon) : null,
         ),
         menuOpen && canSwitch
@@ -372,13 +403,18 @@ window.__ModuleLoader__.load({
               current: answer.detached ? '' : label,
               anchor,
               translate,
-              onClose: () => setMenuOpen(false),
+              key: directory,
+              onClose: closeMenu,
               onPicked: (name) => {
-                setMenuOpen(false)
-                // The poll would catch this within 3s; seed it so the pill
-                // changes as soon as the Host confirms the switch.
-                answers.set(directory, { ...answer, branch: name, detached: false })
-                setAnswer({ ...answer, branch: name, detached: false })
+                invalidateBranch(directory)
+                const next = { ...answer, branch: name, detached: false }
+                rememberAnswer(directory, next)
+                if (!activeRef.current.live || activeRef.current.directory !== directory) return
+                closeMenu()
+                setAnswer(next)
+                readBranch(directory, true).then((value) => {
+                  if (activeRef.current.live && activeRef.current.directory === directory && value !== undefined && answers.get(directory) === value) setAnswer(value)
+                })
               },
             })
           : null,
@@ -455,6 +491,12 @@ window.__ModuleLoader__.load({
         'pill.invalidDirectory': '会话工作目录不是绝对路径，无法查询分支',
         'pill.missingDirectory': '会话工作目录已不存在',
         'pill.gitMissing': '找不到 git 可执行文件：请确认已安装 git 并加入 DSH 进程的 PATH',
+        'pill.directoryPermissionDenied': '无权读取会话工作目录，请检查目录权限',
+        'pill.directoryUnavailable': '暂时无法读取会话工作目录，稍后会自动重试',
+        'pill.gitTimeout': 'Git 查询超时，稍后会自动重试',
+        'pill.gitPermissionDenied': '无权读取 Git 仓库，请检查目录权限或 Git safe.directory 配置',
+        'pill.gitFailed': 'Git 查询失败，稍后会自动重试',
+        'pill.copyFailed': '复制失败',
         'pill.copyHint': '点击切换分支，Ctrl+点击复制分支名',
         'pill.copyHintPlain': '点击复制分支名',
         'pill.copied': '已复制',
@@ -481,6 +523,12 @@ window.__ModuleLoader__.load({
         'pill.invalidDirectory': 'The Session working directory is not an absolute path, so no branch can be looked up',
         'pill.missingDirectory': 'This Session working directory no longer exists',
         'pill.gitMissing': 'No git executable found: install git and put it on the DSH process PATH',
+        'pill.directoryPermissionDenied': 'Cannot read the Session working directory. Check directory permissions.',
+        'pill.directoryUnavailable': 'The Session working directory is temporarily unavailable. It retries automatically.',
+        'pill.gitTimeout': 'Git lookup timed out. It retries automatically.',
+        'pill.gitPermissionDenied': 'Cannot read the Git repository. Check directory permissions or Git safe.directory configuration.',
+        'pill.gitFailed': 'Git lookup failed. It retries automatically.',
+        'pill.copyFailed': 'copy failed',
         'pill.copyHint': 'Click to switch branch, Ctrl+click to copy the name',
         'pill.copyHintPlain': 'Click to copy the branch name',
         'pill.copied': 'copied',
@@ -522,8 +570,11 @@ window.__ModuleLoader__.load({
       switch: '/git/switch',
     }
 
-    /** Cache the availability probe so a poll does not ask every tick. */
+    const BRIDGE_SUCCESS_TTL_MS = 60000
+    const BRIDGE_FAILURE_TTL_MS = 15000
     let bridgeProbe
+    let bridgeResult
+    let bridgeExpires = 0
 
     /** POST JSON the way the git-graph Host half expects it. */
     async function postGit(path, payload) {
@@ -546,14 +597,24 @@ window.__ModuleLoader__.load({
      * @returns {Promise<boolean>} true when its routes are mounted and reachable.
      */
     async function bridgeAvailable() {
-      bridgeProbe ??= postGit(GIT_GRAPH.probe, {})
+      if (Date.now() < bridgeExpires) return bridgeResult
+      if (bridgeProbe !== undefined) return bridgeProbe
+      const request = postGit(GIT_GRAPH.probe, {})
         .then(() => true)
         .catch(() => false)
-      return await bridgeProbe
+        .then((ok) => {
+          if (bridgeProbe !== request) return bridgeAvailable()
+          bridgeResult = ok
+          bridgeExpires = Date.now() + (ok ? BRIDGE_SUCCESS_TTL_MS : BRIDGE_FAILURE_TTL_MS)
+          return ok
+        })
+        .finally(() => { if (bridgeProbe === request) bridgeProbe = undefined })
+      bridgeProbe = request
+      return request
     }
 
-    /** Drop a cached probe so a later render re-checks (after installing git-graph). */
     function resetBridgeProbe() {
+      bridgeExpires = 0
       bridgeProbe = undefined
     }
 
@@ -566,6 +627,7 @@ window.__ModuleLoader__.load({
       try {
         return await postGit(GIT_GRAPH.branches, { path: directory })
       } catch (error) {
+        resetBridgeProbe()
         reportFailure(`git-graph branches failed (${error?.message ?? error})`)
         return null
       }
@@ -597,9 +659,15 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(null)
       const rootRef = React.useRef(null)
       const inputRef = React.useRef(null)
+      const menuRef = React.useRef({ directory, live: false, busy: false })
+      menuRef.current.directory = directory
 
       React.useEffect(() => {
         let live = true
+        menuRef.current.live = true
+        setState({ phase: 'loading', branches: [], error: null })
+        setBusy(null)
+        menuRef.current.busy = false
         listBranches(directory).then((view) => {
           if (!live) return
           if (view === null) {
@@ -610,6 +678,7 @@ window.__ModuleLoader__.load({
         })
         return () => {
           live = false
+          menuRef.current.live = false
         }
       }, [directory])
 
@@ -622,7 +691,7 @@ window.__ModuleLoader__.load({
           }
         }
         const onPointer = (event) => {
-          if (rootRef.current !== null && !rootRef.current.contains(event.target)) onClose()
+          if (rootRef.current !== null && !rootRef.current.contains(event.target)) onClose(false)
         }
         document.addEventListener('keydown', onKey, true)
         document.addEventListener('pointerdown', onPointer, true)
@@ -633,9 +702,14 @@ window.__ModuleLoader__.load({
       }, [onClose])
 
       const pick = async (name) => {
-        if (busy !== null) return
+        if (menuRef.current.busy) return
+        menuRef.current.busy = true
         setBusy(name)
+        invalidateBranch(directory)
         const result = await switchBranch(directory, name)
+        invalidateBranch(directory)
+        if (!menuRef.current.live || menuRef.current.directory !== directory) return
+        menuRef.current.busy = false
         setBusy(null)
         if (result.ok) {
           onPicked(result.branch ?? name)
@@ -668,9 +742,10 @@ window.__ModuleLoader__.load({
           type: 'search',
           value: filter,
           placeholder: translate('menu.filter'),
+          'aria-label': translate('menu.filter'),
           onChange: (event) => setFilter(event.target.value),
         }),
-        state.error !== null ? h('div', { className: 'gbp-menu-error', children: state.error }) : null,
+        state.error !== null ? h('div', { className: 'gbp-menu-error', role: 'alert', children: state.error }) : null,
         state.phase === 'loading'
           ? h('div', { className: 'gbp-menu-empty', children: translate('menu.loading') })
           : items.length === 0

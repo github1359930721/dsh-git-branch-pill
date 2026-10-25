@@ -42,14 +42,16 @@ DeepSeek Harness (DSH) Web 插件：在**每个会话**的输入框下方 dock �
 | `POST /git/status` | `{ path }` → 仓库快照 |
 | `POST /git/switch` | `{ path, branch }` → 真正切分支 |
 
-因此：**git-graph 升级/改动不会破坏胶囊**，卸载它则胶囊自动降级为只读复制，不会报错。探测结果缓存在页面内存里，每会话只探一次。
+因此：git-graph 不可用时胶囊退回只读复制，不影响分支显示。页面内共享探测请求，成功结果缓存 60s、失败结果缓存 15s；轮询会重新探测，网络恢复时立即重试。路由协议不兼容时会显示错误，不会直接导入另一插件的代码。
 
 ## 它做什么
 
 - Host 半（`index.js`）注册 `GET /api/dsh-git-branch?cwd=<绝对路径>[&fresh=1]`，在会话工作目录里跑 `git symbolic-ref --short HEAD`，失败时退回 `rev-parse --short HEAD`（分离 HEAD 显示为 `分离 HEAD · <sha>`）。
 - Client 半（`client.js`）注册 `conversation.composer.dock` 条目，`useSessions` 取当前会话 `cwd`，**每 3 秒轮询一次**（页面隐藏时暂停，`visibilitychange` 恢复后立刻补一次且带 `fresh=1`）。
 - **点击胶囊复制分支名**（hover 有提示，成功后有 1.2s 的「已复制」反馈）。
-- Host 缓存 **2s**（成功）/ 8s（失败），**LRU** 淘汰、最长 256 项；`git` 调用 4s 超时，绝不拖住 UI。
+- Host 缓存 **2s**（成功）/ 8s（非仓库或失败），**LRU** 淘汰、最长 256 项；同目录并发查询共享任务，整次查询（目录检查、Git 解析和所有命令）共用 **4s** 超时预算。
+- Git 缺失、权限错误、查询超时和其他执行错误分别提示，不再把执行失败当成「非 Git」。Git 解析失败缓存 8s 后可重试。
+- 切换成功会使旧查询失效并重新确认分支；迟到响应不会覆盖新状态。复制失败也会给出短暂反馈。
 
 ### 四种结果，分得清
 
@@ -68,11 +70,13 @@ DeepSeek Harness (DSH) Web 插件：在**每个会话**的输入框下方 dock �
 > 早期版本对「确认不是仓库」直接不渲染，表现为**切到非 git 会话时胶囊整块消失**，
 > 和「插件没加载」无法区分。现在改成弱化的 `非 Git` 胶囊，任何会话的 dock 里都恒有一个分支位。
 
-Host 有一道 5s 的 `AbortSignal.timeout`：否则一个卡住的请求会占住 `inFlight` 去重表，让后续每 3s 的 tick 全部复用这个挂起的 Promise，胶囊**永久静默**。
+Client 使用 5s 的 `AbortSignal.timeout` 限制请求等待；Host 整次查询预算为 4s。请求断开时，若没有其他共享调用者，Host 会取消任务并终止活动 Git 子进程。客户端缓存只用于立即显示，不能阻断后续轮询。
+
+自定义 Web 路由必须经过宿主 `connection.requestRejection` 的跨站/登录态检查。本插件声明 `connection` 依赖；若该能力不可用，接口返回 503 `auth-unavailable`，不会继续查询目录。旧宿主缺少这项能力时需要升级，不能绕过鉴权。
 
 ### 轮询成本
 
-每个可见会话每 3s 一个请求，但 Host 端 2s 缓存意味着**同一目录平均每 2–3s 才 spawn 一次 `git`**；页面隐藏（切标签、最小化）时完全停摆。远程/SSH 工作区要按跨越网络的往返成本重新评估这个间隔。
+每个可见会话每 3s 一个请求；Host 同目录并发去重与 2s 缓存限制重复查询。一次普通分支查询通常执行两条 Git 命令，分离 HEAD 通常执行三条。页面隐藏时暂停；远程/SSH 工作区需要按实际往返成本评估轮询间隔。
 
 Console 只在**每种失败首次出现时**记录一次，不会每 3 秒刷屏。
 
@@ -127,6 +131,17 @@ dsh plugin --profile <profile> remove dsh-git-branch-pill
 
 ## 自检
 
+在受支持的 Node（`^22.19.0 || >=24.0.0`）与 Git 环境中运行：
+
+```bash
+npm test                 # 语法、客户端/Host 行为、静态加载、临时仓库集成检查
+npm run test:behavior    # 仅运行模拟网络、时钟和子进程的行为回归
+```
+
+不需要安装依赖。默认测试不会访问真实 DSH 或切换业务仓库分支；Git 集成检查只操作自己创建的临时仓库。Host 测试使用 Node VM Modules，运行时会出现实验性 API 警告，不影响测试结论。CI 配置覆盖 Windows/Linux、Node 22.19 与 24。
+
+以下为单项检查及需要本机 DSH 安装的诊断脚本；后者不纳入 `npm test`：
+
 ```bash
 node tests/handler-check.mjs        # 端点：真实仓库 / 非仓库 / 缺失目录 / 相对路径 / 方法
 node tests/host-hardening.mjs       # Host 加固：git 解析、git 缺失上报、LRU 容量压测
@@ -145,7 +160,7 @@ node tests/git-graph-live.mjs  http://127.0.0.1:<port> <目录>   # 路由是否
 node tests/git-graph-read.mjs  http://127.0.0.1:<port> <目录>   # 真读分支列表
 ```
 
-`handler-check`、`host-hardening` 与 `poll-behavior` 需要本机有 `git`（后者会建临时仓库并真的切分支）；其余纯 Node。
+`handler-check`、`host-hardening` 与 `poll-behavior` 需要本机有 `git`，均使用临时仓库。profile、装配、loader 与会话数据诊断脚本依赖本机 DSH 安装和路径，需按实际环境调整。
 
 ## 踩过的坑（改代码前先看）
 
@@ -194,6 +209,6 @@ if (!answer.repo) {
 
 ## 已知限制
 
-- 分支更新靠轮询：`git checkout` 后最长 **3s**（轮询）可见；页面隐藏时暂停，回到前台立刻刷新。
+- 分支更新靠轮询：正常查询时 `git checkout` 后约一个 **3s** 轮询周期加查询耗时可见；非仓库/失败结果的 Host 缓存最长 8s。页面隐藏时暂停，回到前台或恢复联网立即刷新。
 - 只读 `cwd`，不显示未提交改动、领先/落后上游——按需求只要分支名。
 - 只覆盖 Web/Desktop 页面；不涉及 App 原生端。
